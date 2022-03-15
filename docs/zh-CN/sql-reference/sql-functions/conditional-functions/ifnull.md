@@ -1,7 +1,7 @@
 ---
 {
-    "title": "coalesce",
-    "language": "en"
+    "title": "ifnull",
+    "language": "zh-CN"
 }
 ---
 
@@ -24,39 +24,31 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# coalesce
-## Description
+# ifnull
+## description
 ### Syntax
 
-`VARCHAR coalesce(VARCHAR, ...)`
-`...`
-`INT coalesce(INT, ...)`
+`ifnull(expr1, expr2)`
 
-` coalesce ` function will return the first not null value. If it's all value is null, return null
+
+如果 expr1 的值不为 NULL 则返回 expr1，否则返回 expr2
 
 ## example
 
 ```
-MySQL> select coalesce(1,null,2);
-+----------------------+
-| coalesce(1, NULL, 2) |
-+----------------------+
-|                    1 |
-+----------------------+
+mysql> select ifnull(1,0);
++--------------+
+| ifnull(1, 0) |
++--------------+
+|            1 |
++--------------+
 
-MySQL> select coalesce(null,"asd",1);
-+--------------------------+
-| coalesce(NULL, 'asd', 1) |
-+--------------------------+
-| asd                      |
-+--------------------------+
-
-MySQL> select coalesce(null,null,null);
-+----------------------------+
-| coalesce(NULL, NULL, NULL) |
-+----------------------------+
-|                       NULL |
-+----------------------------+
+mysql> select ifnull(null,10);
++------------------+
+| ifnull(NULL, 10) |
++------------------+
+|               10 |
++------------------+
 ```
 ## keyword
-coalesce
+IFNULL

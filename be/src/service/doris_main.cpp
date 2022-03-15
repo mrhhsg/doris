@@ -37,7 +37,6 @@
 #include <thrift/TOutput.h>
 
 #include "agent/heartbeat_server.h"
-#include "agent/status.h"
 #include "agent/topic_subscriber.h"
 #include "common/config.h"
 #include "common/daemon.h"
@@ -450,11 +449,11 @@ int main(int argc, char** argv) {
     // 4. heart beat server
     doris::TMasterInfo* master_info = exec_env->master_info();
     doris::ThriftServer* heartbeat_thrift_server;
-    doris::AgentStatus heartbeat_status = doris::create_heartbeat_server(
+    doris::Status heartbeat_status = doris::create_heartbeat_server(
             exec_env, doris::config::heartbeat_service_port, &heartbeat_thrift_server,
             doris::config::heartbeat_service_thread_count, master_info);
 
-    if (doris::AgentStatus::DORIS_SUCCESS != heartbeat_status) {
+    if (!heartbeat_status.ok()) {
         LOG(ERROR) << "Heartbeat services did not start correctly, exiting";
         doris::shutdown_logging();
         exit(1);
@@ -484,6 +483,9 @@ int main(int argc, char** argv) {
 #if !defined(ADDRESS_SANITIZER) && !defined(LEAK_SANITIZER) && !defined(THREAD_SANITIZER)
         doris::MemInfo::refresh_current_mem();
 #endif
+         // TODO(zxy) 10s is too long to clear the expired task mem tracker.
+         // It should be actively triggered at the end of query/load.
+        doris::ExecEnv::GetInstance()->task_pool_mem_tracker_registry()->logout_task_mem_tracker();
         sleep(10);
     }
 

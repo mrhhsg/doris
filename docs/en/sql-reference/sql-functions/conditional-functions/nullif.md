@@ -1,7 +1,7 @@
 ---
 {
-    "title": "coalesce",
-    "language": "zh-CN"
+    "title": "nullif",
+    "language": "en"
 }
 ---
 
@@ -24,40 +24,38 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# coalesce
+# nullif
 ## description
 ### Syntax
 
-`VARCHAR coalesce(VARCHAR, ...)`
-`...`
-`INT coalesce(INT, ...)`
+`nullif(expr1, expr2)`
 
-`coalesce`函数会返回第一个非NULL的值，若全部为NULL，则返回NULL
+
+If the two parameters are equal, null is returned. Otherwise, the value of the first parameter is returned. It has the same effect as the following `case when`
+
+```
+CASE
+     WHEN expr1 = expr2 THEN NULL
+     ELSE expr1
+END
+```
 
 ## example
 
 ```
-MySQL> select coalesce(1,null,2);
-+----------------------+
-| coalesce(1, NULL, 2) |
-+----------------------+
-|                    1 |
-+----------------------+
+mysql> select nullif(1,1);
++--------------+
+| nullif(1, 1) |
++--------------+
+|         NULL |
++--------------+
 
-MySQL> select coalesce(null,"asd",1);
-+--------------------------+
-| coalesce(NULL, 'asd', 1) |
-+--------------------------+
-| asd                      |
-+--------------------------+
-
-MySQL> select coalesce(null,null,null);
-+----------------------------+
-| coalesce(NULL, NULL, NULL) |
-+----------------------------+
-|                       NULL |
-+----------------------------+
-
+mysql> select nullif(1,0);
++--------------+
+| nullif(1, 0) |
++--------------+
+|            1 |
++--------------+
 ```
 ## keyword
-coalesce
+NULLIF

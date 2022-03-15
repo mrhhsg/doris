@@ -212,6 +212,7 @@ module.exports = [
       "broker",
       "colocation-join",
       "bucket-shuffle-join",
+      "vectorized-execution-engine",
       "dynamic-partition",
       "export-manual",
       "export_with_mysql_dump",
@@ -368,7 +369,6 @@ module.exports = [
               "ascii",
               "bit_length",
               "char_length",
-              "coalesce",
               "concat",
               "concat_ws",
               "ends_with",
@@ -483,6 +483,17 @@ module.exports = [
               "bitor",
               "bitxor",
               "bitnot"
+            ],
+          },
+          {
+            title: "条件函数",
+            directoryPath: "conditional-functions/",
+            children: [
+              "case",
+              "coalesce",
+              "if",
+              "ifnull",
+              "nullif"
             ],
           },
           {
@@ -689,6 +700,7 @@ module.exports = [
               "SHOW TABLE CREATION",
               "SHOW TABLET",
               "SHOW TRANSACTION",
+              "SHOW-LAST-INSERT",
               "SPARK LOAD",
               "STOP ROUTINE LOAD",
               "STOP SYNC JOB",

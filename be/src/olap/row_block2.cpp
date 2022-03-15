@@ -39,7 +39,7 @@ RowBlockV2::RowBlockV2(const Schema& schema, uint16_t capacity, std::shared_ptr<
         : _schema(schema),
           _capacity(capacity),
           _column_vector_batches(_schema.num_columns()),
-          _tracker(MemTracker::CreateTracker(-1, "RowBlockV2", std::move(parent))),
+          _tracker(MemTracker::create_tracker(-1, "RowBlockV2", std::move(parent))),
           _pool(new MemPool(_tracker.get())),
           _selection_vector(nullptr) {
     for (auto cid : _schema.column_ids()) {
@@ -253,7 +253,8 @@ Status RowBlockV2::_copy_data_to_column(int cid, doris::vectorized::MutableColum
                 auto ptr = reinterpret_cast<const char*>(column_block(cid).cell_ptr(row_idx));
 
                 uint64_t value = *reinterpret_cast<const uint64_t*>(ptr);
-                vectorized::VecDateTimeValue data(value);
+                vectorized::VecDateTimeValue data;
+                data.from_olap_datetime(value);
                 (column_int)->insert_data(reinterpret_cast<char*>(&data), 0);
             } else {
                 column_int->insert_default();

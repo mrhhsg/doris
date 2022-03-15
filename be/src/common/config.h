@@ -163,12 +163,16 @@ CONF_Int32(etl_thread_pool_queue_size, "256");
 CONF_mInt32(thrift_connect_timeout_seconds, "3");
 // default thrift client retry interval (in milliseconds)
 CONF_mInt64(thrift_client_retry_interval_ms, "1000");
-// max row count number for single scan range
+// max row count number for single scan range, used in segmentv1
 CONF_mInt32(doris_scan_range_row_count, "524288");
+// max bytes number for single scan range, used in segmentv2
+CONF_mInt32(doris_scan_range_max_mb, "0");
 // size of scanner queue between scanner thread and compute thread
 CONF_mInt32(doris_scanner_queue_size, "1024");
-// single read execute fragment row size
+// single read execute fragment row number
 CONF_mInt32(doris_scanner_row_num, "16384");
+// single read execute fragment row bytes
+CONF_mInt32(doris_scanner_row_bytes, "10485760");
 // number of max scan keys
 CONF_mInt32(doris_max_scan_key_num, "1024");
 // the max number of push down values of a single column.
@@ -298,7 +302,8 @@ CONF_mInt32(compaction_task_num_per_disk, "2");
 // compaction thread num for fast disk(typically .SSD), must be greater than 2.
 CONF_mInt32(compaction_task_num_per_fast_disk, "4");
 CONF_Validator(compaction_task_num_per_disk, [](const int config) -> bool { return config >= 2; });
-CONF_Validator(compaction_task_num_per_fast_disk, [](const int config) -> bool { return config >= 2; });
+CONF_Validator(compaction_task_num_per_fast_disk,
+               [](const int config) -> bool { return config >= 2; });
 
 // How many rounds of cumulative compaction for each round of base compaction when compaction tasks generation.
 CONF_mInt32(cumulative_compaction_rounds_for_each_base_compaction_round, "9");
@@ -601,10 +606,23 @@ CONF_mInt32(remote_storage_read_buffer_mb, "16");
 
 // Default level of MemTracker to show in web page
 // now MemTracker support two level:
-//      RELEASE: 0
-//      DEBUG: 1
+//      OVERVIEW: 0
+//      TASK: 1
+//      INSTANCE: 2
+//      VERBOSE: 3
 // the level equal or lower than mem_tracker_level will show in web page
-CONF_Int16(mem_tracker_level, "0");
+CONF_mInt16(mem_tracker_level, "0");
+
+// The minimum length when TCMalloc Hook consumes/releases MemTracker, consume size
+// smaller than this value will continue to accumulate. specified as number of bytes.
+// Decreasing this value will increase the frequency of consume/release.
+// Increasing this value will cause MemTracker statistics to be inaccurate.
+CONF_mInt32(mem_tracker_consume_min_size_bytes, "2097152");
+
+// When MemTracker is a negative value, it is considered that a memory leak has occurred,
+// but the actual MemTracker records inaccurately will also cause a negative value,
+// so this feature is in the experimental stage.
+CONF_mBool(memory_leak_detection, "false");
 
 // The version information of the tablet will be stored in the memory
 // in an adjacency graph data structure.

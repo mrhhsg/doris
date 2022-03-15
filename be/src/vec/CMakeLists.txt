@@ -99,6 +99,7 @@ set(VEC_FILES
   exprs/vexpr_context.cpp
   exprs/vliteral.cpp
   exprs/vin_predicate.cpp
+  exprs/vtuple_is_null_predicate.cpp
   exprs/vslot_ref.cpp
   exprs/vcast_expr.cpp
   exprs/vcase_expr.cpp
@@ -117,6 +118,9 @@ set(VEC_FILES
   functions/function_case.cpp
   functions/function_cast.cpp
   functions/function_conv.cpp
+  functions/function_encryption.cpp
+  functions/function_regexp.cpp
+  functions/function_hex.cpp
   functions/function_string.cpp
   functions/function_timestamp.cpp
   functions/function_utility.cpp

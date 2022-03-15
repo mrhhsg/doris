@@ -37,6 +37,7 @@
 #include "exprs/json_functions.h"
 #include "exprs/like_predicate.h"
 #include "exprs/math_functions.h"
+#include "exprs/new_in_predicate.h"
 #include "exprs/operators.h"
 #include "exprs/string_functions.h"
 #include "exprs/table_function/dummy_table_functions.h"
@@ -94,17 +95,6 @@ void Daemon::memory_maintenance_thread() {
         if (env != nullptr) {
             BufferPool* buffer_pool = env->buffer_pool();
             if (buffer_pool != nullptr) buffer_pool->Maintenance();
-
-            // The process limit as measured by our trackers may get out of sync with the
-            // process usage if memory is allocated or freed without updating a MemTracker.
-            // The metric is refreshed whenever memory is consumed or released via a MemTracker,
-            // so on a system with queries executing it will be refreshed frequently. However
-            // if the system is idle, we need to refresh the tracker occasionally since
-            // untracked memory may be allocated or freed, e.g. by background threads.
-            if (env->process_mem_tracker() != nullptr &&
-                !env->process_mem_tracker()->is_consumption_metric_null()) {
-                env->process_mem_tracker()->RefreshConsumptionFromMetric();
-            }
         }
     }
 }
@@ -249,6 +239,7 @@ void Daemon::init(int argc, char** argv, const std::vector<StorePath>& paths) {
     StringFunctions::init();
     ArrayFunctions::init();
     CastFunctions::init();
+    InPredicate::init();
     MathFunctions::init();
     EncryptionFunctions::init();
     TimestampFunctions::init();
