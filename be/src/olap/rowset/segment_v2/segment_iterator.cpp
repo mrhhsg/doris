@@ -33,6 +33,7 @@
 #include "olap/short_key_index.h"
 #include "util/doris_metrics.h"
 #include "util/simd/bits.h"
+#include "vec/columns/column_dictionary.h"
 
 using strings::Substitute;
 
@@ -91,18 +92,14 @@ private:
     bool _eof = false;
 };
 
-SegmentIterator::SegmentIterator(std::shared_ptr<Segment> segment, const Schema& schema,
-                                 std::shared_ptr<MemTracker> parent)
+SegmentIterator::SegmentIterator(std::shared_ptr<Segment> segment, const Schema& schema)
         : _segment(std::move(segment)),
           _schema(schema),
           _column_iterators(_schema.num_columns(), nullptr),
           _bitmap_index_iterators(_schema.num_columns(), nullptr),
           _cur_rowid(0),
           _lazy_materialization_read(false),
-          _inited(false) {
-    // use for count the mem use of ColumnIterator
-    _mem_tracker = MemTracker::create_tracker(-1, "SegmentIterator", std::move(parent));
-}
+          _inited(false) {}
 
 SegmentIterator::~SegmentIterator() {
     for (auto iter : _column_iterators) {
@@ -198,18 +195,16 @@ Status SegmentIterator::_prepare_seek(const StorageReadOptions::KeyRange& key_ra
         }
     }
     _seek_schema = std::make_unique<Schema>(key_fields, key_fields.size());
-    _seek_block = std::make_unique<RowBlockV2>(*_seek_schema, 1, _mem_tracker);
+    _seek_block = std::make_unique<RowBlockV2>(*_seek_schema, 1);
 
     // create used column iterator
     for (auto cid : _seek_schema->column_ids()) {
         if (_column_iterators[cid] == nullptr) {
             RETURN_IF_ERROR(
-                    _segment->new_column_iterator(cid, _mem_tracker, &_column_iterators[cid]));
+                    _segment->new_column_iterator(cid, &_column_iterators[cid]));
             ColumnIteratorOptions iter_opts;
             iter_opts.stats = _opts.stats;
             iter_opts.rblock = _rblock.get();
-            iter_opts.mem_tracker =
-                    MemTracker::create_tracker(-1, "ColumnIterator", _mem_tracker);
             RETURN_IF_ERROR(_column_iterators[cid]->init(iter_opts));
         }
     }
@@ -335,13 +330,11 @@ Status SegmentIterator::_init_return_column_iterators() {
     for (auto cid : _schema.column_ids()) {
         if (_column_iterators[cid] == nullptr) {
             RETURN_IF_ERROR(
-                    _segment->new_column_iterator(cid, _mem_tracker, &_column_iterators[cid]));
+                    _segment->new_column_iterator(cid, &_column_iterators[cid]));
             ColumnIteratorOptions iter_opts;
             iter_opts.stats = _opts.stats;
             iter_opts.use_page_cache = _opts.use_page_cache;
             iter_opts.rblock = _rblock.get();
-            iter_opts.mem_tracker =
-                    MemTracker::create_tracker(-1, "ColumnIterator", _mem_tracker);
             RETURN_IF_ERROR(_column_iterators[cid]->init(iter_opts));
         }
     }
@@ -858,6 +851,19 @@ void SegmentIterator::_evaluate_short_circuit_predicate(uint16_t* vec_sel_rowid_
     for (auto column_predicate : _short_cir_eval_predicate) {
         auto column_id = column_predicate->column_id();
         auto& short_cir_column = _current_return_columns[column_id];
+        auto* col_ptr = short_cir_column.get();
+        // todo(zeno) define convert_dict_codes_if_dictionary interface in IColumn
+        if (short_cir_column->is_nullable()) {
+            auto nullable_col =
+                    reinterpret_cast<vectorized::ColumnNullable*>(short_cir_column.get());
+            col_ptr = nullable_col->get_nested_column_ptr().get();
+        }
+
+        if (col_ptr->is_column_dictionary() && column_predicate->is_range_comparison_predicate()) {
+            auto& dict_col =
+                    reinterpret_cast<vectorized::ColumnDictionary<vectorized::Int32>&>(*col_ptr);
+            dict_col.convert_dict_codes();
+        }
         column_predicate->evaluate(*short_cir_column, vec_sel_rowid_idx, selected_size_ptr);
     }
 

@@ -129,12 +129,10 @@ public:
     OLAPStatus capture_consistent_rowsets(const Version& spec_version,
                                           std::vector<RowsetSharedPtr>* rowsets) const;
     OLAPStatus capture_rs_readers(const Version& spec_version,
-                                  std::vector<RowsetReaderSharedPtr>* rs_readers,
-                                  std::shared_ptr<MemTracker> parent_tracker = nullptr) const;
+                                  std::vector<RowsetReaderSharedPtr>* rs_readers) const;
 
     OLAPStatus capture_rs_readers(const std::vector<Version>& version_path,
-                                  std::vector<RowsetReaderSharedPtr>* rs_readers,
-                                  std::shared_ptr<MemTracker> parent_tracker = nullptr) const;
+                                  std::vector<RowsetReaderSharedPtr>* rs_readers) const;
 
     DelPredicateArray delete_predicates() { return _tablet_meta->delete_predicates(); }
     void add_delete_predicate(const DeletePredicatePB& delete_predicate, int64_t version);
@@ -160,6 +158,8 @@ public:
     inline Mutex* get_cumulative_lock() { return &_cumulative_lock; }
 
     inline std::shared_mutex& get_migration_lock() { return _migration_lock; }
+
+    inline std::mutex& get_schema_change_lock() { return _schema_change_lock; }
 
     // operation for compaction
     bool can_do_compaction(size_t path_hash, CompactionType compaction_type);
@@ -306,6 +306,7 @@ private:
     Mutex _ingest_lock;
     Mutex _base_lock;
     Mutex _cumulative_lock;
+    std::mutex _schema_change_lock;
     std::shared_mutex _migration_lock;
 
     // TODO(lingbin): There is a _meta_lock TabletMeta too, there should be a comment to
