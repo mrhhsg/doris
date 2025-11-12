@@ -32,7 +32,6 @@
 
 #include "common/status.h"
 #include "olap/rowset/segment_v2/ann_index/ann_search_params.h"
-#include "olap/rowset/segment_v2/column_reader.h"
 #include "olap/rowset/segment_v2/index_reader.h"
 #include "olap/rowset/segment_v2/inverted_index_reader.h"
 #include "runtime/define_primitive_type.h"

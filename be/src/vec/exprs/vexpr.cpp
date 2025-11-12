@@ -35,6 +35,7 @@
 #include "common/status.h"
 #include "olap/rowset/segment_v2/ann_index/ann_search_params.h"
 #include "olap/rowset/segment_v2/ann_index/ann_topn_runtime.h"
+#include "olap/rowset/segment_v2/column_reader.h"
 #include "pipeline/pipeline_task.h"
 #include "runtime/define_primitive_type.h"
 #include "vec/columns/column_vector.h"

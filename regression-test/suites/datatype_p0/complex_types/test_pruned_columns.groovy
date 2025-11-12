@@ -16,6 +16,7 @@
 // under the License.
 
 suite("test_pruned_columns") {
+    sql "set batch_size = 32;"
     sql """DROP TABLE IF EXISTS `tbl_test_pruned_columns`"""
     sql """
         CREATE TABLE `tbl_test_pruned_columns` (
@@ -23,40 +24,179 @@ suite("test_pruned_columns") {
             `s` struct<city:text,data:array<map<int,struct<a:int,b:double>>>> NULL
         ) ENGINE=OLAP
         DUPLICATE KEY(`id`)
-        DISTRIBUTED BY RANDOM BUCKETS AUTO
+        DISTRIBUTED BY RANDOM BUCKETS 2
         PROPERTIES (
         "replication_allocation" = "tag.location.default: 1"
         );
     """
 
     sql """
-        insert into `tbl_test_pruned_columns` values
-            (1, named_struct('city', 'beijing', 'data', array(map(1, named_struct('a', 10, 'b', 20.0), 2, named_struct('a', 30, 'b', 40))))),
-            (2, named_struct('city', 'shanghai', 'data', array(map(2, named_struct('a', 50, 'b', 40.0), 1, named_struct('a', 70, 'b', 80)))));
+        insert into `tbl_test_pruned_columns`
+        select 
+            number as id,
+            named_struct(
+                'city', 
+                case (number % 10)
+                    when 0 then 'beijing'
+                    when 1 then 'shanghai'
+                    when 2 then 'shenzhen'
+                    when 3 then 'guangzhou'
+                    when 4 then 'hangzhou'
+                    when 5 then 'chengdu'
+                    when 6 then 'wuhan'
+                    when 7 then 'xian'
+                    when 8 then 'nanjing'
+                    else null
+                end,
+                'data', 
+                array(
+                    map(
+                        1, named_struct('a', number * 10, 'b', (number * 10 + number % 5) * 1.0),
+                        2, named_struct('a', number * 10 + 20, 'b', (number % 10 + 1) * 10.0)
+                    ),
+                    map(
+                        (number % 3 + 1), named_struct('a', number * 5, 'b', number * 2.5),
+                        (number % 5 + 2), named_struct('a', number * 3, 'b', number * 1.5)
+                    )
+                )
+            ) as s
+        from numbers("number" = "3000");
     """
 
     qt_sql """
-        select * from `tbl_test_pruned_columns` order by 1;
+        select struct_element(s, 'city'), count() from `tbl_test_pruned_columns` group by struct_element(s, 'city') order by 1, 2;
     """
 
     qt_sql1 """
-        select b.id, array_map(x -> struct_element(map_values(x)[1], 'a'), struct_element(s, 'data')) from `tbl_test_pruned_columns` t join (select 1 id) b on t.id = b.id order by 1;
+        select
+            b.id
+            , array_map(x -> struct_element(map_values(x)[1], 'a')
+            , struct_element(s, 'data'))
+        from `tbl_test_pruned_columns` t join (select 1 id) b on t.id = b.id
+        order by 1, 2 limit 0, 20;
+    """
+
+    qt_sql1_1 """
+        select
+            b.id
+            , array_map(x -> struct_element(map_values(x)[1], 'a')
+            , struct_element(s, 'data'))
+        from `tbl_test_pruned_columns` t join (select 1 id) b on t.id = b.id
+        order by 1, 2 limit 100, 20;
+    """
+
+    qt_sql1_2 """
+        select
+            b.id
+            , array_map(x -> struct_element(map_values(x)[1], 'a')
+            , struct_element(s, 'data'))
+        from `tbl_test_pruned_columns` t join (select 1 id) b on t.id = b.id
+        order by 1 desc, 2 limit 100, 20;
     """
 
     qt_sql2 """
-        select id, struct_element(s, 'city') from `tbl_test_pruned_columns` order by 1;
+        select id, struct_element(s, 'city') from `tbl_test_pruned_columns` order by 1 limit 0, 20;
+    """
+
+    qt_sql2_1 """
+        select id, struct_element(s, 'city') from `tbl_test_pruned_columns` order by 1 limit 100, 20;
+    """
+
+    qt_sql2_2 """
+        select id, struct_element(s, 'city') from `tbl_test_pruned_columns` order by 1 desc limit 0, 20;
     """
 
     qt_sql3 """
-        select id, struct_element(s, 'data') from `tbl_test_pruned_columns` order by 1;
+        select id, struct_element(s, 'data') from `tbl_test_pruned_columns` order by 1 limit 0, 20;
+    """
+
+    qt_sql3_1 """
+        select id, struct_element(s, 'data') from `tbl_test_pruned_columns` order by 1 limit 200, 20;
+    """
+
+    qt_sql3_2 """
+        select id, struct_element(s, 'data') from `tbl_test_pruned_columns` order by 1 desc limit 0, 20;
     """
 
     qt_sql4 """
-        select id, struct_element(s, 'data') from `tbl_test_pruned_columns` where struct_element(struct_element(s, 'data')[1][2], 'b') = 40 order by 1;
+        select
+            id
+            , struct_element(s, 'data')
+        from `tbl_test_pruned_columns`
+        where struct_element(struct_element(s, 'data')[1][2], 'b') = 40 
+        order by 1 limit 0, 20;
+    """
+
+    qt_sql4_1 """
+        select
+            id
+            , struct_element(s, 'data')
+        from `tbl_test_pruned_columns`
+        where struct_element(struct_element(s, 'data')[1][2], 'b') = 40 
+        order by 1 limit 100, 20;
+    """
+
+    qt_sql4_2 """
+        select
+            id
+            , struct_element(s, 'data')
+        from `tbl_test_pruned_columns`
+        where struct_element(struct_element(s, 'data')[1][2], 'b') = 40 
+        order by 1 desc limit 0, 20;
     """
 
     qt_sql5 """
-        select id, struct_element(s, 'city') from `tbl_test_pruned_columns` where struct_element(struct_element(s, 'data')[1][2], 'b') = 40 order by 1;
+        select
+            id
+            , struct_element(s, 'city')
+        from `tbl_test_pruned_columns`
+        where struct_element(struct_element(s, 'data')[1][2], 'b') = 40 
+        order by 1, 2 limit 0, 20;
+    """
+
+    qt_sql5_1 """
+        select
+            id
+            , struct_element(s, 'city')
+        from `tbl_test_pruned_columns`
+        where struct_element(struct_element(s, 'data')[1][2], 'b') = 40 
+        order by 1, 2 limit 100, 20;
+    """
+
+    qt_sql5_2 """
+        select
+            id
+            , struct_element(s, 'city')
+        from `tbl_test_pruned_columns`
+        where struct_element(struct_element(s, 'data')[1][2], 'b') = 40 
+        order by 1 desc, 2 limit 0, 20;
+    """
+
+    qt_sql6 """
+        select
+            id
+            , struct_element(struct_element(s, 'data')[2][3], 'b')
+        from `tbl_test_pruned_columns`
+        where struct_element(s, 'city') = 'chengdu'
+        order by 1, 2 limit 0, 20;
+    """
+
+    qt_sql6_1 """
+        select
+            id
+            , struct_element(struct_element(s, 'data')[2][3], 'b')
+        from `tbl_test_pruned_columns`
+        where struct_element(s, 'city') = 'chengdu'
+        order by 1, 2 limit 100, 20;
+    """
+
+    qt_sql6_2 """
+        select
+            id
+            , struct_element(struct_element(s, 'data')[2][3], 'b')
+        from `tbl_test_pruned_columns`
+        where struct_element(s, 'city') = 'chengdu'
+        order by 1 desc, 2 limit 0, 20;
     """
 
     sql """DROP TABLE IF EXISTS `tbl_test_pruned_columns_map`"""
@@ -78,11 +218,11 @@ suite("test_pruned_columns") {
             (2, '{"theme_preference":{"attribute_value":"light", "confidence_score":0.99, "last_updated":"2025-11-03 15:32:33"}, "language_setting":{"attribute_value":"es", "confidence_score":0.92, "last_updated":"2025-11-03 15:32:33"}}');
     """
 
-    qt_sql6 """
+    qt_sql7 """
         select count(struct_element(dynamic_attributes['theme_preference'], 'confidence_score')) from `tbl_test_pruned_columns_map`;
     """
 
-    qt_sql7 """
+    qt_sql8 """
         select struct_element(dynamic_attributes['theme_preference'], 'confidence_score') from `tbl_test_pruned_columns_map` order by id;
     """
 }
