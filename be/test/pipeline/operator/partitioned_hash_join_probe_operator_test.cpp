@@ -20,9 +20,12 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <unordered_map>
+#include <vector>
 
 #include "common/config.h"
 #include "partitioned_hash_join_test_helper.h"
+#include "pipeline/dependency.h"
 #include "pipeline/exec/hashjoin_build_sink.h"
 #include "pipeline/exec/partitioned_hash_join_sink_operator.h"
 #include "pipeline/pipeline_task.h"
@@ -38,6 +41,38 @@
 #include "vec/spill/spill_stream_manager.h"
 
 namespace doris::pipeline {
+namespace {
+// Match spill partition bit slicing used by hash join spill.
+uint32_t spill_partition_index(uint32_t hash, uint32_t level) {
+    return (hash >> (level * kHashJoinSpillBitsPerLevel)) & (kHashJoinSpillFanout - 1);
+}
+
+// Follow build-side split hierarchy to decide the final partition for a hash.
+HashJoinSpillPartitionId find_partition_for_hash(
+        uint32_t hash, const HashJoinSpillBuildPartitionMap& build_partitions) {
+    HashJoinSpillPartitionId id {0, spill_partition_index(hash, 0)};
+    auto it = build_partitions.find(id.key());
+    while (it != build_partitions.end() && it->second.is_split &&
+           id.level < kHashJoinSpillMaxDepth) {
+        const auto child_index = spill_partition_index(hash, id.level + 1);
+        id = id.child(child_index);
+        it = build_partitions.find(id.key());
+    }
+    return id;
+}
+
+size_t partition_rows(const HashJoinSpillPartition& partition) {
+    size_t rows = 0;
+    if (partition.accumulating_block) {
+        rows += partition.accumulating_block->rows();
+    }
+    for (const auto& block : partition.blocks) {
+        rows += block.rows();
+    }
+    return rows;
+}
+} // namespace
+
 class PartitionedHashJoinProbeOperatorTest : public testing::Test {
 public:
     void SetUp() override { _helper.SetUp(); }
@@ -179,7 +214,10 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, spill_probe_blocks) {
 
         vectorized::Block block = vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>(
                 {1 * i, 2 * i, 3 * i});
-        local_state->_probe_blocks[i].emplace_back(std::move(block));
+        HashJoinSpillPartitionId partition_id {0, static_cast<uint32_t>(i)};
+        auto& partition = local_state->_shared_state->probe_partitions[partition_id.key()];
+        partition.id = partition_id;
+        partition.blocks.emplace_back(std::move(block));
     }
 
     std::vector<int32_t> large_data(3 * 1024 * 1024);
@@ -193,11 +231,18 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, spill_probe_blocks) {
             vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>(small_data);
 
     // add a large block to the last partition
-    local_state->_partitioned_blocks[PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT - 1] =
+    HashJoinSpillPartitionId last_partition_id {
+            0, PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT - 1};
+    auto& last_partition = local_state->_shared_state->probe_partitions[last_partition_id.key()];
+    last_partition.id = last_partition_id;
+    last_partition.accumulating_block =
             vectorized::MutableBlock::create_unique(std::move(large_block));
 
     // add a small block to the first partition
-    local_state->_partitioned_blocks[0] =
+    HashJoinSpillPartitionId first_partition_id {0, 0};
+    auto& first_partition = local_state->_shared_state->probe_partitions[first_partition_id.key()];
+    first_partition.id = first_partition_id;
+    first_partition.accumulating_block =
             vectorized::MutableBlock::create_unique(std::move(small_block));
 
     local_state->_shared_state->is_spilled = false;
@@ -211,13 +256,12 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, spill_probe_blocks) {
 
     std::cout << "profile: " << local_state->custom_profile()->pretty_print() << std::endl;
 
-    for (int32_t i = 0; i != PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT; ++i) {
-        if (!local_state->_probe_spilling_streams[i]) {
-            continue;
+    // Cleanup spill streams from probe_partitions
+    for (auto& [key, partition] : local_state->_shared_state->probe_partitions) {
+        if (partition.spill_stream) {
+            ExecEnv::GetInstance()->spill_stream_mgr()->delete_spill_stream(partition.spill_stream);
+            partition.spill_stream.reset();
         }
-        ExecEnv::GetInstance()->spill_stream_mgr()->delete_spill_stream(
-                local_state->_probe_spilling_streams[i]);
-        local_state->_probe_spilling_streams[i].reset();
     }
 
     auto* write_rows_counter = local_state->custom_profile()->get_counter("SpillWriteRows");
@@ -233,8 +277,10 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, RecoverProbeBlocksFromDisk) {
                                                         probe_operator.get(), shared_state);
 
     // Create and register a spill stream for testing
-    const uint32_t test_partition = 0;
-    auto& spill_stream = local_state->_probe_spilling_streams[test_partition];
+    HashJoinSpillPartitionId partition_id {0, 0};
+    auto& partition = local_state->_shared_state->probe_partitions[partition_id.key()];
+    partition.id = partition_id;
+    auto& spill_stream = partition.spill_stream;
     ASSERT_TRUE(ExecEnv::GetInstance()
                         ->spill_stream_mgr()
                         ->register_spill_stream(
@@ -256,14 +302,14 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, RecoverProbeBlocksFromDisk) {
     bool has_data = false;
     ASSERT_TRUE(local_state
                         ->recover_probe_blocks_from_disk(_helper.runtime_state.get(),
-                                                         test_partition, has_data)
+                                                         partition_id.key(), has_data)
                         .ok());
     ASSERT_TRUE(has_data);
 
     std::cout << "profile: " << local_state->custom_profile()->pretty_print() << std::endl;
 
     // Verify recovered data
-    auto& probe_blocks = local_state->_probe_blocks[test_partition];
+    auto& probe_blocks = partition.blocks;
     ASSERT_FALSE(probe_blocks.empty());
     ASSERT_EQ(probe_blocks[0].rows(), 3);
 
@@ -276,7 +322,7 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, RecoverProbeBlocksFromDisk) {
     ASSERT_EQ(recovery_blocks_counter->value(), 1);
 
     // Verify stream cleanup
-    ASSERT_EQ(local_state->_probe_spilling_streams[test_partition], nullptr);
+    ASSERT_EQ(partition.spill_stream, nullptr);
 }
 
 TEST_F(PartitionedHashJoinProbeOperatorTest, RecoverProbeBlocksFromDiskLargeData) {
@@ -287,8 +333,10 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, RecoverProbeBlocksFromDiskLargeData
                                                         probe_operator.get(), shared_state);
 
     // Create and register a spill stream for testing
-    const uint32_t test_partition = 0;
-    auto& spill_stream = local_state->_probe_spilling_streams[test_partition];
+    HashJoinSpillPartitionId partition_id {0, 0};
+    auto& partition = local_state->_shared_state->probe_partitions[partition_id.key()];
+    partition.id = partition_id;
+    auto& spill_stream = partition.spill_stream;
     ASSERT_TRUE(ExecEnv::GetInstance()
                         ->spill_stream_mgr()
                         ->register_spill_stream(
@@ -320,14 +368,14 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, RecoverProbeBlocksFromDiskLargeData
     while (has_data) {
         ASSERT_TRUE(local_state
                             ->recover_probe_blocks_from_disk(_helper.runtime_state.get(),
-                                                             test_partition, has_data)
+                                                             partition_id.key(), has_data)
                             .ok());
     }
 
     std::cout << "profile: " << local_state->custom_profile()->pretty_print() << std::endl;
 
     // Verify recovered data
-    auto& probe_blocks = local_state->_probe_blocks[test_partition];
+    auto& probe_blocks = partition.blocks;
     ASSERT_FALSE(probe_blocks.empty());
     ASSERT_EQ(probe_blocks[0].rows(), 8 * 1024 * 1024 + 10);
     ASSERT_EQ(probe_blocks[1].rows(), 3);
@@ -341,7 +389,7 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, RecoverProbeBlocksFromDiskLargeData
     ASSERT_EQ(recovery_blocks_counter->value(), 2);
 
     // Verify stream cleanup
-    ASSERT_EQ(local_state->_probe_spilling_streams[test_partition], nullptr);
+    ASSERT_EQ(partition.spill_stream, nullptr);
 }
 
 TEST_F(PartitionedHashJoinProbeOperatorTest, RecoverProbeBlocksFromDiskEmpty) {
@@ -352,9 +400,10 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, RecoverProbeBlocksFromDiskEmpty) {
                                                         probe_operator.get(), shared_state);
 
     // Test multiple cases
-    const uint32_t test_partition = 0;
-
-    auto& spilled_stream = local_state->_probe_spilling_streams[test_partition];
+    HashJoinSpillPartitionId partition_id {0, 0};
+    auto& partition = local_state->_shared_state->probe_partitions[partition_id.key()];
+    partition.id = partition_id;
+    auto& spilled_stream = partition.spill_stream;
     ASSERT_TRUE(ExecEnv::GetInstance()
                         ->spill_stream_mgr()
                         ->register_spill_stream(
@@ -368,12 +417,11 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, RecoverProbeBlocksFromDiskEmpty) {
     bool has_data = false;
     ASSERT_TRUE(local_state
                         ->recover_probe_blocks_from_disk(_helper.runtime_state.get(),
-                                                         test_partition, has_data)
+                                                         partition_id.key(), has_data)
                         .ok());
     ASSERT_TRUE(has_data);
 
-    ASSERT_TRUE(local_state->_probe_blocks[test_partition].empty())
-            << "probe blocks not empty: " << local_state->_probe_blocks[test_partition].size();
+    ASSERT_TRUE(partition.blocks.empty()) << "probe blocks not empty: " << partition.blocks.size();
 
     ASSERT_TRUE(spilled_stream == nullptr);
 }
@@ -386,9 +434,10 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, RecoverProbeBlocksFromDiskError) {
                                                         probe_operator.get(), shared_state);
 
     // Test multiple cases
-    const uint32_t test_partition = 0;
-
-    auto& spilling_stream = local_state->_probe_spilling_streams[test_partition];
+    HashJoinSpillPartitionId partition_id {0, 0};
+    auto& partition = local_state->_shared_state->probe_partitions[partition_id.key()];
+    partition.id = partition_id;
+    auto& spilling_stream = partition.spill_stream;
     ASSERT_TRUE(ExecEnv::GetInstance()
                         ->spill_stream_mgr()
                         ->register_spill_stream(
@@ -409,7 +458,7 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, RecoverProbeBlocksFromDiskError) {
     SpillableDebugPointHelper dp_helper("fault_inject::spill_stream::read_next_block");
     bool has_data = false;
     auto status = local_state->recover_probe_blocks_from_disk(_helper.runtime_state.get(),
-                                                              test_partition, has_data);
+                                                              partition_id.key(), has_data);
 
     ExecEnv::GetInstance()->spill_stream_mgr()->delete_spill_stream(spilling_stream);
     spilling_stream.reset();
@@ -431,7 +480,11 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, RecoverBuildBlocksFromDisk) {
 
     // Create and register spill stream with test data
     const uint32_t test_partition = 0;
-    auto& spilled_stream = local_state->_shared_state->spilled_streams[test_partition];
+    HashJoinSpillPartitionId test_partition_id {0, test_partition};
+    auto& build_partition = local_state->_shared_state->build_partitions[test_partition_id.key()];
+    build_partition.id = test_partition_id;
+    auto& spilled_stream = build_partition.spill_stream;
+
     ASSERT_TRUE(ExecEnv::GetInstance()
                         ->spill_stream_mgr()
                         ->register_spill_stream(
@@ -468,9 +521,6 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, RecoverBuildBlocksFromDisk) {
     auto* recovery_blocks_counter =
             local_state->custom_profile()->get_counter("SpillReadBlockCount");
     ASSERT_EQ(recovery_blocks_counter->value(), 1);
-
-    // Verify stream cleanup
-    ASSERT_EQ(local_state->_shared_state->spilled_streams[test_partition], nullptr);
 }
 
 TEST_F(PartitionedHashJoinProbeOperatorTest, need_more_input_data) {
@@ -515,13 +565,15 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, revocable_mem_size) {
 
     local_state->_child_eos = false;
     auto block1 = vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({1, 2, 3});
-    local_state->_probe_blocks[0].emplace_back(block1);
+    HashJoinSpillPartitionId partition_id {0, 0};
+    auto& partition = shared_state->probe_partitions[partition_id.key()];
+    partition.id = partition_id;
+    partition.blocks.emplace_back(block1);
     ASSERT_EQ(probe_operator->revocable_mem_size(_helper.runtime_state.get()),
               block1.allocated_bytes());
     auto block2 =
             vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({1, 2, 3, 5, 6, 7});
-    local_state->_partitioned_blocks[0] =
-            vectorized::MutableBlock::create_unique(std::move(block2));
+    partition.accumulating_block = vectorized::MutableBlock::create_unique(std::move(block2));
 
     // block2 is small, so it should not be counted
     ASSERT_EQ(probe_operator->revocable_mem_size(_helper.runtime_state.get()),
@@ -534,8 +586,7 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, revocable_mem_size) {
             vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>(large_data);
 
     const auto large_size = large_block.allocated_bytes();
-    local_state->_partitioned_blocks[0] =
-            vectorized::MutableBlock::create_unique(std::move(large_block));
+    partition.accumulating_block = vectorized::MutableBlock::create_unique(std::move(large_block));
     ASSERT_EQ(probe_operator->revocable_mem_size(_helper.runtime_state.get()),
               block1.allocated_bytes() + large_size);
 
@@ -586,7 +637,11 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, RecoverBuildBlocksFromDiskEmpty) {
 
     // Test empty stream
     const uint32_t test_partition = 0;
-    auto& spilled_stream = local_state->_shared_state->spilled_streams[test_partition];
+    HashJoinSpillPartitionId test_partition_id {0, test_partition};
+    auto& build_partition = local_state->_shared_state->build_partitions[test_partition_id.key()];
+    ASSERT_EQ(build_partition.id.level, test_partition_id.level);
+    ASSERT_EQ(build_partition.id.path, test_partition_id.path);
+    auto& spilled_stream = build_partition.spill_stream;
     ASSERT_TRUE(ExecEnv::GetInstance()
                         ->spill_stream_mgr()
                         ->register_spill_stream(
@@ -619,7 +674,9 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, RecoverBuildBlocksFromDiskLargeData
 
     // Test empty stream
     const uint32_t test_partition = 0;
-    auto& spilled_stream = local_state->_shared_state->spilled_streams[test_partition];
+    HashJoinSpillPartitionId test_partition_id {0, test_partition};
+    auto& build_partition = local_state->_shared_state->build_partitions[test_partition_id.key()];
+    auto& spilled_stream = build_partition.spill_stream;
     ASSERT_TRUE(ExecEnv::GetInstance()
                         ->spill_stream_mgr()
                         ->register_spill_stream(
@@ -681,7 +738,9 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, RecoverBuildBlocksFromDiskError) {
 
     // Test empty stream
     const uint32_t test_partition = 0;
-    auto& spilled_stream = local_state->_shared_state->spilled_streams[test_partition];
+    HashJoinSpillPartitionId test_partition_id {0, test_partition};
+    auto& build_partition = local_state->_shared_state->build_partitions[test_partition_id.key()];
+    auto& spilled_stream = build_partition.spill_stream;
     ASSERT_TRUE(ExecEnv::GetInstance()
                         ->spill_stream_mgr()
                         ->register_spill_stream(
@@ -769,8 +828,8 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, PushEmptyBlock) {
 
     // Setup local state
     std::shared_ptr<MockPartitionedHashJoinSharedState> shared_state;
-    auto local_state = _helper.create_probe_local_state(_helper.runtime_state.get(),
-                                                        probe_operator.get(), shared_state);
+    _helper.create_probe_local_state(_helper.runtime_state.get(), probe_operator.get(),
+                                     shared_state);
 
     // Create empty input block
     vectorized::Block empty_block;
@@ -778,11 +837,6 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, PushEmptyBlock) {
     // Test pushing empty block without EOS
     auto st = probe_operator->push(_helper.runtime_state.get(), &empty_block, false);
     ASSERT_TRUE(st.ok());
-
-    // Verify no partitioned blocks were created
-    for (uint32_t i = 0; i < probe_operator->_partition_count; ++i) {
-        ASSERT_EQ(local_state->_partitioned_blocks[i], nullptr);
-    }
 }
 
 TEST_F(PartitionedHashJoinProbeOperatorTest, PushPartitionData) {
@@ -810,9 +864,9 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, PushPartitionData) {
 
     // Verify partitioned blocks
     int64_t total_partitioned_rows = 0;
-    for (uint32_t i = 0; i < probe_operator->_partition_count; ++i) {
-        if (local_state->_partitioned_blocks[i]) {
-            total_partitioned_rows += local_state->_partitioned_blocks[i]->rows();
+    for (auto& [key, partition] : local_state->_shared_state->probe_partitions) {
+        if (partition.accumulating_block) {
+            total_partitioned_rows += partition.accumulating_block->rows();
         }
     }
     ASSERT_EQ(total_partitioned_rows, 5); // All rows should be partitioned
@@ -847,16 +901,16 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, PushWithEOS) {
 
     // Verify all data is moved to probe blocks due to EOS
     int64_t total_probe_block_rows = 0;
-    for (uint32_t i = 0; i < probe_operator->_partition_count; ++i) {
-        for (const auto& block : local_state->_probe_blocks[i]) {
+    for (auto& [key, partition] : local_state->_shared_state->probe_partitions) {
+        for (const auto& block : partition.blocks) {
             total_probe_block_rows += block.rows();
         }
     }
     ASSERT_EQ(total_probe_block_rows, 3); // All rows should be in probe blocks
 
     // Verify partitioned blocks are cleared
-    for (uint32_t i = 0; i < probe_operator->_partition_count; ++i) {
-        ASSERT_EQ(local_state->_partitioned_blocks[i], nullptr);
+    for (auto& [key, partition] : local_state->_shared_state->probe_partitions) {
+        ASSERT_EQ(partition.accumulating_block, nullptr);
     }
 }
 
@@ -889,17 +943,17 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, PushLargeBlock) {
     // Verify some partitions have blocks moved to probe_blocks due to size threshold
     bool found_probe_blocks = false;
     size_t partitioned_rows_count = 0;
-    for (uint32_t i = 0; i < probe_operator->_partition_count; ++i) {
-        if (!local_state->_probe_blocks[i].empty()) {
-            for (auto& block : local_state->_probe_blocks[i]) {
+    for (auto& [key, partition] : local_state->_shared_state->probe_partitions) {
+        if (!partition.blocks.empty()) {
+            for (auto& block : partition.blocks) {
                 if (!block.empty()) {
                     partitioned_rows_count += block.rows();
                     found_probe_blocks = true;
                 }
             }
         }
-        if (local_state->_partitioned_blocks[i] && !local_state->_partitioned_blocks[i]->empty()) {
-            partitioned_rows_count += local_state->_partitioned_blocks[i]->rows();
+        if (partition.accumulating_block && !partition.accumulating_block->empty()) {
+            partitioned_rows_count += partition.accumulating_block->rows();
             found_probe_blocks = true;
         }
     }
@@ -939,8 +993,10 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, PullMultiplePartitions) {
                                                         probe_operator.get(), shared_state);
 
     for (uint32_t i = 0; i < PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT; i++) {
-        auto& probe_blocks = local_state->_probe_blocks[i];
-        probe_blocks.emplace_back(
+        HashJoinSpillPartitionId partition_id {0, i};
+        auto& partition = shared_state->probe_partitions[partition_id.key()];
+        partition.id = partition_id;
+        partition.blocks.emplace_back(
                 vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({1, 2, 3}));
     }
 
@@ -970,9 +1026,12 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, PullWithDiskRecovery) {
 
     local_state->_shared_state->is_spilled = true;
 
-    const uint32_t test_partition = 0;
-    auto& spilled_stream = local_state->_shared_state->spilled_streams[test_partition];
-    auto& spilling_stream = local_state->_probe_spilling_streams[test_partition];
+    HashJoinSpillPartitionId partition_id {0, 0};
+    auto& spilled_stream =
+            local_state->_shared_state->build_partitions[partition_id.key()].spill_stream;
+    auto& probe_partition = local_state->_shared_state->probe_partitions[partition_id.key()];
+    probe_partition.id = partition_id;
+    auto& spilling_stream = probe_partition.spill_stream;
 
     local_state->_need_to_setup_internal_operators = true;
 
@@ -995,7 +1054,7 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, PullWithDiskRecovery) {
             vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({1, 2, 3});
     st = spilled_stream->spill_block(_helper.runtime_state.get(), spill_block, true);
     ASSERT_TRUE(st) << "Spill block failed: " << st.to_string();
-    st = spilling_stream->spill_block(_helper.runtime_state.get(), spill_block, false);
+    st = spilling_stream->spill_block(_helper.runtime_state.get(), spill_block, true);
     ASSERT_TRUE(st) << "Spill block failed: " << st.to_string();
 
     vectorized::Block output_block;
@@ -1033,6 +1092,1006 @@ TEST_F(PartitionedHashJoinProbeOperatorTest, PullWithEmptyPartition) {
     // 验证分区游标已更新
     ASSERT_EQ(1, local_state->_partition_cursor)
             << "Partition cursor should move to next after empty partition";
+}
+
+TEST_F(PartitionedHashJoinProbeOperatorTest, SplitProbePartitionCreatesChildren) {
+    auto [probe_operator, sink_operator] = _helper.create_operators();
+
+    std::shared_ptr<MockPartitionedHashJoinSharedState> shared_state;
+    auto local_state = _helper.create_probe_local_state(_helper.runtime_state.get(),
+                                                        probe_operator.get(), shared_state);
+
+    RowDescriptor row_desc(_helper.runtime_state->desc_tbl(), {0});
+    const auto& tnode = probe_operator->_tnode;
+    local_state->_partitioner = create_spill_partitioner(
+            _helper.runtime_state.get(), PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT,
+            {tnode.hash_join_node.eq_join_conjuncts[0].left}, row_desc);
+
+    std::vector<int32_t> data(100);
+    std::iota(data.begin(), data.end(), 0);
+    vectorized::Block block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>(data);
+    HashJoinSpillPartitionId partition_id {0, 0};
+    auto& partition = shared_state->probe_partitions[partition_id.key()];
+    partition.id = partition_id;
+    partition.accumulating_block = vectorized::MutableBlock::create_unique(std::move(block));
+
+    auto st = probe_operator->_split_probe_partition(_helper.runtime_state.get(), *local_state,
+                                                     partition_id);
+    ASSERT_TRUE(st.ok()) << "split failed: " << st.to_string();
+
+    auto parent_it = shared_state->probe_partitions.find(partition_id.key());
+    ASSERT_TRUE(parent_it != shared_state->probe_partitions.end());
+    ASSERT_TRUE(parent_it->second.is_split);
+    ASSERT_FALSE(parent_it->second.children.empty());
+    ASSERT_EQ(parent_it->second.accumulating_block, nullptr);
+    ASSERT_TRUE(local_state->_base_partition_split[0]);
+
+    // Child blocks should preserve total rows after split.
+    size_t total_rows = 0;
+    for (const auto& child_id : parent_it->second.children) {
+        auto child_it = shared_state->probe_partitions.find(child_id.key());
+        ASSERT_TRUE(child_it != shared_state->probe_partitions.end());
+        for (const auto& child_block : child_it->second.blocks) {
+            total_rows += child_block.rows();
+        }
+    }
+    ASSERT_EQ(total_rows, 100);
+    ASSERT_EQ(local_state->_pending_partitions.size(), parent_it->second.children.size());
+}
+
+TEST_F(PartitionedHashJoinProbeOperatorTest, SplitProbePartitionRespectsMaxDepth) {
+    auto [probe_operator, sink_operator] = _helper.create_operators();
+
+    std::shared_ptr<MockPartitionedHashJoinSharedState> shared_state;
+    auto local_state = _helper.create_probe_local_state(_helper.runtime_state.get(),
+                                                        probe_operator.get(), shared_state);
+
+    HashJoinSpillPartitionId partition_id {kHashJoinSpillMaxDepth, 0};
+    auto& partition = shared_state->probe_partitions[partition_id.key()];
+    partition.id = partition_id;
+    partition.blocks.emplace_back(
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({1, 2, 3}));
+
+    auto st = probe_operator->_split_probe_partition(_helper.runtime_state.get(), *local_state,
+                                                     partition_id);
+    ASSERT_TRUE(st.ok()) << "split failed: " << st.to_string();
+    ASSERT_TRUE(partition.children.empty());
+    ASSERT_FALSE(partition.blocks.empty());
+    ASSERT_TRUE(local_state->_pending_partitions.empty());
+}
+
+TEST_F(PartitionedHashJoinProbeOperatorTest, SplitBuildPartitionCreatesChildren) {
+    auto [probe_operator, sink_operator] = _helper.create_operators();
+
+    std::shared_ptr<MockPartitionedHashJoinSharedState> shared_state;
+    auto local_state = _helper.create_probe_local_state(_helper.runtime_state.get(),
+                                                        probe_operator.get(), shared_state);
+
+    RowDescriptor build_row_desc(_helper.runtime_state->desc_tbl(), {1});
+    const auto& tnode = probe_operator->_tnode;
+    local_state->_build_partitioner = create_spill_partitioner(
+            _helper.runtime_state.get(), PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT,
+            {tnode.hash_join_node.eq_join_conjuncts[0].right}, build_row_desc);
+
+    vectorized::Block build_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({1, 2, 3, 4, 5});
+
+    auto build_partition_id = HashJoinSpillPartitionId {0, 0};
+    auto& build_partition = shared_state->build_partitions[build_partition_id.key()];
+    ASSERT_EQ(build_partition.id.level, build_partition_id.level);
+    ASSERT_EQ(build_partition.id.path, build_partition_id.path);
+    build_partition.build_block = vectorized::MutableBlock::create_unique(std::move(build_block));
+
+    HashJoinSpillPartitionId partition_id {0, 0};
+    auto st = probe_operator->_split_build_partition(_helper.runtime_state.get(), *local_state,
+                                                     partition_id);
+    ASSERT_TRUE(st.ok()) << "split failed: " << st.to_string();
+
+    auto parent_it = shared_state->build_partitions.find(partition_id.key());
+    ASSERT_TRUE(parent_it != shared_state->build_partitions.end());
+    ASSERT_TRUE(parent_it->second.is_split);
+    ASSERT_FALSE(parent_it->second.children.empty());
+
+    size_t total_rows = 0;
+    for (const auto& child_id : parent_it->second.children) {
+        auto child_it = shared_state->build_partitions.find(child_id.key());
+        ASSERT_TRUE(child_it != shared_state->build_partitions.end());
+        if (child_it->second.build_block) {
+            total_rows += child_it->second.build_block->rows();
+        }
+    }
+    ASSERT_EQ(total_rows, 5);
+}
+
+TEST_F(PartitionedHashJoinProbeOperatorTest, ProbeFollowsMultiLevelBuildSplit) {
+    auto [probe_operator, sink_operator] = _helper.create_operators();
+
+    std::shared_ptr<MockPartitionedHashJoinSharedState> shared_state;
+    auto local_state = _helper.create_probe_local_state(_helper.runtime_state.get(),
+                                                        probe_operator.get(), shared_state);
+
+    RowDescriptor row_desc(_helper.runtime_state->desc_tbl(), {0});
+    const auto& tnode = probe_operator->_tnode;
+    local_state->_partitioner = create_spill_partitioner(
+            _helper.runtime_state.get(), PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT,
+            {tnode.hash_join_node.eq_join_conjuncts[0].left}, row_desc);
+
+    std::vector<int32_t> data(2048);
+    std::iota(data.begin(), data.end(), 0);
+    vectorized::Block block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>(data);
+    ASSERT_TRUE(
+            local_state->_partitioner->do_partitioning(_helper.runtime_state.get(), &block).ok());
+
+    const auto* hashes = local_state->_partitioner->get_channel_ids().get<uint32_t>();
+    const uint32_t base_index = spill_partition_index(hashes[0], 0);
+    std::array<size_t, kHashJoinSpillFanout> child_counts {};
+    for (uint32_t i = 0; i < block.rows(); ++i) {
+        if (spill_partition_index(hashes[i], 0) != base_index) {
+            continue;
+        }
+        child_counts[spill_partition_index(hashes[i], 1)]++;
+    }
+
+    uint32_t split_child_index = 0;
+    bool found_child = false;
+    for (uint32_t i = 0; i < kHashJoinSpillFanout; ++i) {
+        if (child_counts[i] > 0) {
+            split_child_index = i;
+            found_child = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_child) << "No rows found for base partition child split";
+
+    auto& build_partitions = shared_state->build_partitions;
+    HashJoinSpillPartitionId parent_id {0, base_index};
+    auto& parent = build_partitions[parent_id.key()];
+    parent.id = parent_id;
+    parent.is_split = true;
+    parent.children.clear();
+    for (uint32_t i = 0; i < kHashJoinSpillFanout; ++i) {
+        HashJoinSpillPartitionId child_id = parent_id.child(i);
+        HashJoinSpillBuildPartition build_partition;
+        build_partition.id = child_id;
+        build_partitions.try_emplace(child_id.key(), std::move(build_partition));
+        parent.children.emplace_back(child_id);
+    }
+    HashJoinSpillPartitionId split_child_id = parent_id.child(split_child_index);
+    auto& split_child = build_partitions[split_child_id.key()];
+    split_child.id = split_child_id;
+    split_child.is_split = true;
+    split_child.children.clear();
+    for (uint32_t i = 0; i < kHashJoinSpillFanout; ++i) {
+        HashJoinSpillPartitionId grandchild_id = split_child_id.child(i);
+        HashJoinSpillBuildPartition build_partition;
+        build_partition.id = grandchild_id;
+        build_partitions.try_emplace(grandchild_id.key(), std::move(build_partition));
+        split_child.children.emplace_back(grandchild_id);
+    }
+
+    auto st = probe_operator->push(_helper.runtime_state.get(), &block, true);
+    ASSERT_TRUE(st.ok()) << "push failed: " << st.to_string();
+
+    size_t expected_level2_rows = 0;
+    for (uint32_t i = 0; i < block.rows(); ++i) {
+        auto id = find_partition_for_hash(hashes[i], build_partitions);
+        if (id.level >= 2) {
+            expected_level2_rows++;
+        }
+    }
+    ASSERT_GT(expected_level2_rows, 0u);
+
+    size_t actual_level2_rows = 0;
+    for (const auto& [_, partition] : shared_state->probe_partitions) {
+        if (partition.id.level >= 2) {
+            actual_level2_rows += partition_rows(partition);
+        }
+    }
+    ASSERT_EQ(actual_level2_rows, expected_level2_rows);
+}
+
+TEST_F(PartitionedHashJoinProbeOperatorTest, SplitProbeSpillStreamsAcrossLevels) {
+    auto [probe_operator, sink_operator] = _helper.create_operators();
+
+    std::shared_ptr<MockPartitionedHashJoinSharedState> shared_state;
+    auto local_state = _helper.create_probe_local_state(_helper.runtime_state.get(),
+                                                        probe_operator.get(), shared_state);
+
+    RowDescriptor row_desc(_helper.runtime_state->desc_tbl(), {0});
+    const auto& tnode = probe_operator->_tnode;
+    local_state->_partitioner = create_spill_partitioner(
+            _helper.runtime_state.get(), PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT,
+            {tnode.hash_join_node.eq_join_conjuncts[0].left}, row_desc);
+
+    std::vector<int32_t> values(4096);
+    std::iota(values.begin(), values.end(), 0);
+    vectorized::Block full_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>(values);
+    ASSERT_TRUE(local_state->_partitioner->do_partitioning(_helper.runtime_state.get(), &full_block)
+                        .ok());
+
+    const auto* hashes = local_state->_partitioner->get_channel_ids().get<uint32_t>();
+    std::vector<int32_t> parent_values;
+    for (uint32_t i = 0; i < full_block.rows(); ++i) {
+        if (spill_partition_index(hashes[i], 0) == 0) {
+            parent_values.emplace_back(values[i]);
+        }
+    }
+    ASSERT_FALSE(parent_values.empty());
+
+    vectorized::Block parent_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>(parent_values);
+
+    vectorized::SpillStreamSPtr parent_stream;
+    auto st = ExecEnv::GetInstance()->spill_stream_mgr()->register_spill_stream(
+            _helper.runtime_state.get(), parent_stream, print_id(_helper.runtime_state->query_id()),
+            "hash_probe_parent", probe_operator->node_id(), std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<size_t>::max(), local_state->operator_profile());
+    ASSERT_TRUE(st) << "Register spill stream failed: " << st.to_string();
+    st = parent_stream->spill_block(_helper.runtime_state.get(), parent_block, false);
+    ASSERT_TRUE(st) << "Spill block failed: " << st.to_string();
+    st = parent_stream->spill_eof();
+    ASSERT_TRUE(st) << "Spill eof failed: " << st.to_string();
+
+    HashJoinSpillPartitionId root_id {0, 0};
+    auto& root_partition = shared_state->probe_partitions[root_id.key()];
+    root_partition.id = root_id;
+    root_partition.spill_stream = parent_stream;
+
+    st = probe_operator->_split_probe_partition(_helper.runtime_state.get(), *local_state, root_id);
+    ASSERT_TRUE(st.ok()) << "split failed: " << st.to_string();
+    ASSERT_EQ(root_partition.spill_stream, nullptr);
+
+    auto& partitions = shared_state->probe_partitions;
+    auto parent_it = partitions.find(root_id.key());
+    ASSERT_TRUE(parent_it != partitions.end());
+    ASSERT_TRUE(parent_it->second.is_split);
+    ASSERT_FALSE(parent_it->second.children.empty());
+
+    HashJoinSpillPartitionId child_id {};
+    bool found_child_stream = false;
+    for (const auto& candidate : parent_it->second.children) {
+        auto child_it = partitions.find(candidate.key());
+        if (child_it != partitions.end() && child_it->second.spill_stream &&
+            child_it->second.spill_stream->get_written_bytes() > 0) {
+            child_id = candidate;
+            found_child_stream = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_child_stream);
+
+    st = probe_operator->_split_probe_partition(_helper.runtime_state.get(), *local_state,
+                                                child_id);
+    ASSERT_TRUE(st.ok()) << "split failed: " << st.to_string();
+
+    auto child_it = partitions.find(child_id.key());
+    ASSERT_TRUE(child_it != partitions.end());
+    ASSERT_TRUE(child_it->second.is_split);
+    ASSERT_FALSE(child_it->second.children.empty());
+    ASSERT_EQ(child_it->second.spill_stream, nullptr);
+
+    bool found_grandchild_stream = false;
+    for (const auto& candidate : child_it->second.children) {
+        auto grandchild_it = partitions.find(candidate.key());
+        if (grandchild_it != partitions.end() && grandchild_it->second.spill_stream &&
+            grandchild_it->second.spill_stream->get_written_bytes() > 0) {
+            found_grandchild_stream = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_grandchild_stream);
+}
+
+TEST_F(PartitionedHashJoinProbeOperatorTest, SplitBuildSpillStreamsAcrossLevels) {
+    auto [probe_operator, sink_operator] = _helper.create_operators();
+
+    std::shared_ptr<MockPartitionedHashJoinSharedState> shared_state;
+    auto local_state = _helper.create_probe_local_state(_helper.runtime_state.get(),
+                                                        probe_operator.get(), shared_state);
+
+    RowDescriptor build_row_desc(_helper.runtime_state->desc_tbl(), {1});
+    const auto& tnode = probe_operator->_tnode;
+    local_state->_build_partitioner = create_spill_partitioner(
+            _helper.runtime_state.get(), PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT,
+            {tnode.hash_join_node.eq_join_conjuncts[0].right}, build_row_desc);
+
+    std::vector<int32_t> values(4096);
+    std::iota(values.begin(), values.end(), 0);
+    vectorized::Block full_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>(values);
+    ASSERT_TRUE(local_state->_build_partitioner
+                        ->do_partitioning(_helper.runtime_state.get(), &full_block)
+                        .ok());
+
+    const auto* hashes = local_state->_build_partitioner->get_channel_ids().get<uint32_t>();
+    std::vector<int32_t> parent_values;
+    for (uint32_t i = 0; i < full_block.rows(); ++i) {
+        if (spill_partition_index(hashes[i], 0) == 0) {
+            parent_values.emplace_back(values[i]);
+        }
+    }
+    ASSERT_FALSE(parent_values.empty());
+
+    vectorized::Block parent_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>(parent_values);
+
+    vectorized::SpillStreamSPtr parent_stream;
+    auto st = ExecEnv::GetInstance()->spill_stream_mgr()->register_spill_stream(
+            _helper.runtime_state.get(), parent_stream, print_id(_helper.runtime_state->query_id()),
+            "hash_build_parent", probe_operator->node_id(), std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<size_t>::max(), local_state->operator_profile());
+    ASSERT_TRUE(st) << "Register spill stream failed: " << st.to_string();
+    st = parent_stream->spill_block(_helper.runtime_state.get(), parent_block, false);
+    ASSERT_TRUE(st) << "Spill block failed: " << st.to_string();
+    st = parent_stream->spill_eof();
+    ASSERT_TRUE(st) << "Spill eof failed: " << st.to_string();
+
+    HashJoinSpillPartitionId root_id {0, 0};
+    auto& build_partition = shared_state->build_partitions[root_id.key()];
+    build_partition.spill_stream = parent_stream;
+    st = probe_operator->_split_build_partition(_helper.runtime_state.get(), *local_state, root_id);
+    ASSERT_TRUE(st.ok()) << "split failed: " << st.to_string();
+    ASSERT_EQ(build_partition.spill_stream, nullptr);
+
+    auto& partitions = shared_state->build_partitions;
+    auto parent_it = partitions.find(root_id.key());
+    ASSERT_TRUE(parent_it != partitions.end());
+    ASSERT_TRUE(parent_it->second.is_split);
+    ASSERT_FALSE(parent_it->second.children.empty());
+
+    HashJoinSpillPartitionId child_id {};
+    bool found_child_stream = false;
+    for (const auto& candidate : parent_it->second.children) {
+        auto child_it = partitions.find(candidate.key());
+        if (child_it != partitions.end() && child_it->second.spill_stream &&
+            child_it->second.spill_stream->get_written_bytes() > 0) {
+            child_id = candidate;
+            found_child_stream = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_child_stream);
+
+    st = probe_operator->_split_build_partition(_helper.runtime_state.get(), *local_state,
+                                                child_id);
+    ASSERT_TRUE(st.ok()) << "split failed: " << st.to_string();
+
+    auto child_it = partitions.find(child_id.key());
+    ASSERT_TRUE(child_it != partitions.end());
+    ASSERT_TRUE(child_it->second.is_split);
+    ASSERT_FALSE(child_it->second.children.empty());
+    ASSERT_EQ(child_it->second.spill_stream, nullptr);
+
+    bool found_grandchild_stream = false;
+    for (const auto& candidate : child_it->second.children) {
+        auto grandchild_it = partitions.find(candidate.key());
+        if (grandchild_it != partitions.end() && grandchild_it->second.spill_stream &&
+            grandchild_it->second.spill_stream->get_written_bytes() > 0) {
+            found_grandchild_stream = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_grandchild_stream);
+}
+
+TEST_F(PartitionedHashJoinProbeOperatorTest, MultiLevelBuildSplitKeepsProbeAligned) {
+    auto [probe_operator, sink_operator] = _helper.create_operators();
+
+    std::shared_ptr<MockPartitionedHashJoinSharedState> shared_state;
+    auto local_state = _helper.create_probe_local_state(_helper.runtime_state.get(),
+                                                        probe_operator.get(), shared_state);
+
+    RowDescriptor probe_row_desc(_helper.runtime_state->desc_tbl(), {0});
+    RowDescriptor build_row_desc(_helper.runtime_state->desc_tbl(), {1});
+    const auto& tnode = probe_operator->_tnode;
+    local_state->_partitioner = create_spill_partitioner(
+            _helper.runtime_state.get(), PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT,
+            {tnode.hash_join_node.eq_join_conjuncts[0].left}, probe_row_desc);
+    local_state->_build_partitioner = create_spill_partitioner(
+            _helper.runtime_state.get(), PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT,
+            {tnode.hash_join_node.eq_join_conjuncts[0].right}, build_row_desc);
+
+    std::vector<int32_t> values(8192);
+    std::iota(values.begin(), values.end(), 0);
+    vectorized::Block probe_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>(values);
+    vectorized::Block build_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>(values);
+
+    ASSERT_TRUE(local_state->_build_partitioner
+                        ->do_partitioning(_helper.runtime_state.get(), &build_block)
+                        .ok());
+    const auto* build_hashes = local_state->_build_partitioner->get_channel_ids().get<uint32_t>();
+
+    const uint32_t base_index = spill_partition_index(build_hashes[0], 0);
+    std::array<size_t, kHashJoinSpillFanout> child_counts {};
+    for (uint32_t i = 0; i < build_block.rows(); ++i) {
+        if (spill_partition_index(build_hashes[i], 0) != base_index) {
+            continue;
+        }
+        child_counts[spill_partition_index(build_hashes[i], 1)]++;
+    }
+
+    uint32_t split_child_index = 0;
+    bool found_child = false;
+    for (uint32_t i = 0; i < kHashJoinSpillFanout; ++i) {
+        if (child_counts[i] > 0) {
+            split_child_index = i;
+            found_child = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_child);
+
+    auto& build_partitions = shared_state->build_partitions;
+    HashJoinSpillPartitionId parent_id {0, base_index};
+    auto& parent = build_partitions[parent_id.key()];
+    parent.id = parent_id;
+    parent.is_split = true;
+    parent.children.clear();
+    for (uint32_t i = 0; i < kHashJoinSpillFanout; ++i) {
+        HashJoinSpillPartitionId child_id = parent_id.child(i);
+        HashJoinSpillBuildPartition build_partition;
+        build_partition.id = child_id;
+        build_partitions.try_emplace(child_id.key(), std::move(build_partition));
+        parent.children.emplace_back(child_id);
+    }
+    HashJoinSpillPartitionId child_id = parent_id.child(split_child_index);
+    auto& child = build_partitions[child_id.key()];
+    child.id = child_id;
+    child.is_split = true;
+    child.children.clear();
+    for (uint32_t i = 0; i < kHashJoinSpillFanout; ++i) {
+        HashJoinSpillPartitionId grandchild_id = child_id.child(i);
+        HashJoinSpillBuildPartition build_partition;
+        build_partition.id = grandchild_id;
+        build_partitions.try_emplace(grandchild_id.key(), std::move(build_partition));
+        child.children.emplace_back(grandchild_id);
+    }
+
+    auto st = probe_operator->push(_helper.runtime_state.get(), &probe_block, true);
+    ASSERT_TRUE(st.ok()) << "push failed: " << st.to_string();
+
+    ASSERT_TRUE(
+            local_state->_partitioner->do_partitioning(_helper.runtime_state.get(), &probe_block)
+                    .ok());
+    const auto* probe_hashes = local_state->_partitioner->get_channel_ids().get<uint32_t>();
+
+    size_t expected_level2_rows = 0;
+    for (uint32_t i = 0; i < probe_block.rows(); ++i) {
+        auto id = find_partition_for_hash(probe_hashes[i], build_partitions);
+        if (id.level >= 2) {
+            expected_level2_rows++;
+        }
+    }
+    ASSERT_GT(expected_level2_rows, 0u);
+
+    size_t actual_level2_rows = 0;
+    for (const auto& [_, partition] : shared_state->probe_partitions) {
+        if (partition.id.level >= 2) {
+            actual_level2_rows += partition_rows(partition);
+        }
+    }
+    ASSERT_EQ(actual_level2_rows, expected_level2_rows);
+}
+
+TEST_F(PartitionedHashJoinProbeOperatorTest, EndToEndProcessesLevelTwoPartition) {
+    auto [probe_operator, sink_operator] = _helper.create_operators();
+
+    std::shared_ptr<MockPartitionedHashJoinSharedState> shared_state;
+    auto local_state = _helper.create_probe_local_state(_helper.runtime_state.get(),
+                                                        probe_operator.get(), shared_state);
+
+    shared_state->is_spilled = true;
+    local_state->_need_to_setup_internal_operators = true;
+    local_state->_child_eos = true;
+
+    HashJoinSpillPartitionId partition_id {2, 0};
+    auto& build_partition = shared_state->build_partitions[partition_id.key()];
+    build_partition.id = partition_id;
+    build_partition.build_block = vectorized::MutableBlock::create_unique(
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({1, 2, 3}));
+
+    auto& probe_partition = shared_state->probe_partitions[partition_id.key()];
+    probe_partition.id = partition_id;
+    probe_partition.blocks.emplace_back(
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({1, 2, 3}));
+
+    local_state->_pending_partitions.emplace_back(partition_id);
+
+    vectorized::Block output_block;
+    bool eos = false;
+    auto st = probe_operator->get_block(_helper.runtime_state.get(), &output_block, &eos);
+    ASSERT_TRUE(st.ok()) << "get_block failed: " << st.to_string();
+    ASSERT_FALSE(eos);
+    ASSERT_EQ(output_block.rows(), 3);
+}
+
+TEST_F(PartitionedHashJoinProbeOperatorTest, EndToEndProcessesPendingSplitPartitions) {
+    auto [probe_operator, sink_operator] = _helper.create_operators();
+
+    std::shared_ptr<MockPartitionedHashJoinSharedState> shared_state;
+    auto local_state = _helper.create_probe_local_state(_helper.runtime_state.get(),
+                                                        probe_operator.get(), shared_state);
+
+    shared_state->is_spilled = true;
+    local_state->_need_to_setup_internal_operators = true;
+    local_state->_child_eos = true;
+    local_state->_partition_cursor = PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT;
+
+    HashJoinSpillPartitionId first_id {2, 0};
+    HashJoinSpillPartitionId second_id {2, 1};
+
+    auto& first_build = shared_state->build_partitions[first_id.key()];
+    first_build.id = first_id;
+    first_build.build_block = vectorized::MutableBlock::create_unique(
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({1, 2, 3}));
+
+    auto& first_probe = shared_state->probe_partitions[first_id.key()];
+    first_probe.id = first_id;
+    first_probe.blocks.emplace_back(
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({1, 2, 3}));
+
+    auto& second_build = shared_state->build_partitions[second_id.key()];
+    second_build.id = second_id;
+    second_build.build_block = vectorized::MutableBlock::create_unique(
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({7, 8}));
+
+    auto& second_probe = shared_state->probe_partitions[second_id.key()];
+    second_probe.id = second_id;
+    second_probe.blocks.emplace_back(
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({7, 8}));
+
+    // Process pending split partitions in order.
+    local_state->_pending_partitions.emplace_back(first_id);
+    local_state->_pending_partitions.emplace_back(second_id);
+
+    vectorized::Block output_block;
+    bool eos = false;
+    auto st = probe_operator->get_block(_helper.runtime_state.get(), &output_block, &eos);
+    ASSERT_TRUE(st.ok()) << "get_block failed: " << st.to_string();
+    ASSERT_FALSE(eos);
+    ASSERT_EQ(output_block.rows(), 3);
+
+    output_block.clear();
+    st = probe_operator->get_block(_helper.runtime_state.get(), &output_block, &eos);
+    ASSERT_TRUE(st.ok()) << "get_block failed: " << st.to_string();
+    ASSERT_FALSE(eos);
+    ASSERT_EQ(output_block.rows(), 2);
+
+    bool seen_eos = false;
+    for (uint32_t i = 0; i < PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT + 1; ++i) {
+        output_block.clear();
+        st = probe_operator->get_block(_helper.runtime_state.get(), &output_block, &eos);
+        ASSERT_TRUE(st.ok()) << "get_block failed: " << st.to_string();
+        if (eos) {
+            seen_eos = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(seen_eos);
+}
+
+TEST_F(PartitionedHashJoinProbeOperatorTest, EndToEndProcessesAutoSplitChildPartition) {
+    auto [probe_operator, sink_operator] = _helper.create_operators();
+
+    std::shared_ptr<MockPartitionedHashJoinSharedState> shared_state;
+    auto local_state = _helper.create_probe_local_state(_helper.runtime_state.get(),
+                                                        probe_operator.get(), shared_state);
+
+    RowDescriptor probe_row_desc(_helper.runtime_state->desc_tbl(), {0});
+    RowDescriptor build_row_desc(_helper.runtime_state->desc_tbl(), {1});
+    const auto& tnode = probe_operator->_tnode;
+    local_state->_partitioner = create_spill_partitioner(
+            _helper.runtime_state.get(), PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT,
+            {tnode.hash_join_node.eq_join_conjuncts[0].left}, probe_row_desc);
+    local_state->_build_partitioner = create_spill_partitioner(
+            _helper.runtime_state.get(), PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT,
+            {tnode.hash_join_node.eq_join_conjuncts[0].right}, build_row_desc);
+
+    vectorized::Block build_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({1, 2, 3, 4, 5});
+
+    HashJoinSpillPartitionId build_partition_id {0, 0};
+    auto& build_partition = shared_state->build_partitions[build_partition_id.key()];
+    ASSERT_EQ(build_partition.id.level, build_partition_id.level);
+    ASSERT_EQ(build_partition.id.path, build_partition_id.path);
+    build_partition.build_block = vectorized::MutableBlock::create_unique(std::move(build_block));
+
+    vectorized::Block probe_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({1, 2, 3, 4, 5});
+    HashJoinSpillPartitionId root_id {0, 0};
+    auto& root_partition = shared_state->probe_partitions[root_id.key()];
+    root_partition.id = root_id;
+    root_partition.accumulating_block =
+            vectorized::MutableBlock::create_unique(std::move(probe_block));
+
+    auto st = probe_operator->_split_build_partition(_helper.runtime_state.get(), *local_state,
+                                                     root_id);
+    ASSERT_TRUE(st.ok()) << "split build failed: " << st.to_string();
+    st = probe_operator->_split_probe_partition(_helper.runtime_state.get(), *local_state, root_id);
+    ASSERT_TRUE(st.ok()) << "split probe failed: " << st.to_string();
+    ASSERT_FALSE(local_state->_pending_partitions.empty());
+
+    auto child_id = local_state->_pending_partitions.front();
+    auto child_it = shared_state->probe_partitions.find(child_id.key());
+    ASSERT_TRUE(child_it != shared_state->probe_partitions.end());
+    ASSERT_FALSE(child_it->second.blocks.empty());
+    const size_t expected_rows = child_it->second.blocks.front().rows();
+
+    shared_state->is_spilled = true;
+    local_state->_need_to_setup_internal_operators = true;
+    local_state->_child_eos = true;
+    local_state->_base_partition_split.assign(PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT,
+                                              true);
+
+    vectorized::Block output_block;
+    bool eos = false;
+    st = probe_operator->get_block(_helper.runtime_state.get(), &output_block, &eos);
+    ASSERT_TRUE(st.ok()) << "get_block failed: " << st.to_string();
+    ASSERT_FALSE(eos);
+    ASSERT_EQ(output_block.rows(), expected_rows);
+}
+
+TEST_F(PartitionedHashJoinProbeOperatorTest, EndToEndProcessesAutoSplitGrandchildPartition) {
+    auto [probe_operator, sink_operator] = _helper.create_operators();
+
+    std::shared_ptr<MockPartitionedHashJoinSharedState> shared_state;
+    auto local_state = _helper.create_probe_local_state(_helper.runtime_state.get(),
+                                                        probe_operator.get(), shared_state);
+
+    RowDescriptor probe_row_desc(_helper.runtime_state->desc_tbl(), {0});
+    RowDescriptor build_row_desc(_helper.runtime_state->desc_tbl(), {1});
+    const auto& tnode = probe_operator->_tnode;
+    local_state->_partitioner = create_spill_partitioner(
+            _helper.runtime_state.get(), PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT,
+            {tnode.hash_join_node.eq_join_conjuncts[0].left}, probe_row_desc);
+    local_state->_build_partitioner = create_spill_partitioner(
+            _helper.runtime_state.get(), PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT,
+            {tnode.hash_join_node.eq_join_conjuncts[0].right}, build_row_desc);
+
+    vectorized::Block build_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({1, 2, 3, 4, 5, 6});
+    HashJoinSpillPartitionId build_partition_id {0, 0};
+    auto& build_partition = shared_state->build_partitions[build_partition_id.key()];
+    ASSERT_EQ(build_partition.id.level, build_partition_id.level);
+    ASSERT_EQ(build_partition.id.path, build_partition_id.path);
+    build_partition.build_block = vectorized::MutableBlock::create_unique(std::move(build_block));
+
+    vectorized::Block probe_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({1, 2, 3, 4, 5, 6});
+    HashJoinSpillPartitionId root_id {0, 0};
+    auto& root_partition = shared_state->probe_partitions[root_id.key()];
+    root_partition.id = root_id;
+    root_partition.accumulating_block =
+            vectorized::MutableBlock::create_unique(std::move(probe_block));
+
+    auto st = probe_operator->_split_build_partition(_helper.runtime_state.get(), *local_state,
+                                                     root_id);
+    ASSERT_TRUE(st.ok()) << "split build failed: " << st.to_string();
+    st = probe_operator->_split_probe_partition(_helper.runtime_state.get(), *local_state, root_id);
+    ASSERT_TRUE(st.ok()) << "split probe failed: " << st.to_string();
+    ASSERT_FALSE(local_state->_pending_partitions.empty());
+
+    auto child_id = local_state->_pending_partitions.front();
+    auto child_it = shared_state->build_partitions.find(child_id.key());
+    ASSERT_TRUE(child_it != shared_state->build_partitions.end());
+
+    st = probe_operator->_split_build_partition(_helper.runtime_state.get(), *local_state,
+                                                child_id);
+    ASSERT_TRUE(st.ok()) << "split build failed: " << st.to_string();
+    st = probe_operator->_split_probe_partition(_helper.runtime_state.get(), *local_state,
+                                                child_id);
+    ASSERT_TRUE(st.ok()) << "split probe failed: " << st.to_string();
+    ASSERT_FALSE(local_state->_pending_partitions.empty());
+
+    HashJoinSpillPartitionId grandchild_id {};
+    bool found_grandchild = false;
+    for (const auto& candidate : local_state->_pending_partitions) {
+        if (candidate.level == 2) {
+            grandchild_id = candidate;
+            found_grandchild = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_grandchild);
+
+    auto grandchild_it = shared_state->probe_partitions.find(grandchild_id.key());
+    ASSERT_TRUE(grandchild_it != shared_state->probe_partitions.end());
+    ASSERT_FALSE(grandchild_it->second.blocks.empty());
+    const size_t expected_rows = grandchild_it->second.blocks.front().rows();
+
+    shared_state->is_spilled = true;
+    local_state->_need_to_setup_internal_operators = true;
+    local_state->_child_eos = true;
+    local_state->_partition_cursor = PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT;
+
+    vectorized::Block output_block;
+    bool eos = false;
+    local_state->_pending_partitions.clear();
+    local_state->_pending_partitions.emplace_back(grandchild_id);
+    st = probe_operator->get_block(_helper.runtime_state.get(), &output_block, &eos);
+    ASSERT_TRUE(st.ok()) << "get_block failed: " << st.to_string();
+    ASSERT_FALSE(eos);
+    ASSERT_EQ(output_block.rows(), expected_rows);
+}
+
+TEST_F(PartitionedHashJoinProbeOperatorTest, EndToEndProcessesSplitGrandchildFromProbeSpillStream) {
+    auto [probe_operator, sink_operator] = _helper.create_operators();
+
+    std::shared_ptr<MockPartitionedHashJoinSharedState> shared_state;
+    auto local_state = _helper.create_probe_local_state(_helper.runtime_state.get(),
+                                                        probe_operator.get(), shared_state);
+
+    RowDescriptor probe_row_desc(_helper.runtime_state->desc_tbl(), {0});
+    RowDescriptor build_row_desc(_helper.runtime_state->desc_tbl(), {1});
+    const auto& tnode = probe_operator->_tnode;
+    local_state->_partitioner = create_spill_partitioner(
+            _helper.runtime_state.get(), PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT,
+            {tnode.hash_join_node.eq_join_conjuncts[0].left}, probe_row_desc);
+    local_state->_build_partitioner = create_spill_partitioner(
+            _helper.runtime_state.get(), PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT,
+            {tnode.hash_join_node.eq_join_conjuncts[0].right}, build_row_desc);
+
+    vectorized::Block build_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({1, 2, 3, 4, 5, 6});
+    HashJoinSpillPartitionId build_partition_id {0, 0};
+    auto& build_partition = shared_state->build_partitions[build_partition_id.key()];
+    ASSERT_EQ(build_partition.id.level, build_partition_id.level);
+    ASSERT_EQ(build_partition.id.path, build_partition_id.path);
+    build_partition.build_block = vectorized::MutableBlock::create_unique(std::move(build_block));
+
+    std::vector<int32_t> values(4096);
+    std::iota(values.begin(), values.end(), 0);
+    vectorized::Block full_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>(values);
+    ASSERT_TRUE(local_state->_partitioner->do_partitioning(_helper.runtime_state.get(), &full_block)
+                        .ok());
+
+    const auto* hashes = local_state->_partitioner->get_channel_ids().get<uint32_t>();
+    std::vector<int32_t> parent_values;
+    for (uint32_t i = 0; i < full_block.rows(); ++i) {
+        if (spill_partition_index(hashes[i], 0) == 0) {
+            parent_values.emplace_back(values[i]);
+        }
+    }
+    ASSERT_FALSE(parent_values.empty());
+
+    vectorized::Block parent_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>(parent_values);
+
+    vectorized::SpillStreamSPtr parent_stream;
+    auto st = ExecEnv::GetInstance()->spill_stream_mgr()->register_spill_stream(
+            _helper.runtime_state.get(), parent_stream, print_id(_helper.runtime_state->query_id()),
+            "hash_probe_parent", probe_operator->node_id(), std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<size_t>::max(), local_state->operator_profile());
+    ASSERT_TRUE(st) << "Register spill stream failed: " << st.to_string();
+    st = parent_stream->spill_block(_helper.runtime_state.get(), parent_block, false);
+    ASSERT_TRUE(st) << "Spill block failed: " << st.to_string();
+    st = parent_stream->spill_eof();
+    ASSERT_TRUE(st) << "Spill eof failed: " << st.to_string();
+
+    HashJoinSpillPartitionId root_id {0, 0};
+    auto& root_partition = shared_state->probe_partitions[root_id.key()];
+    root_partition.id = root_id;
+    root_partition.spill_stream = parent_stream;
+
+    st = probe_operator->_split_build_partition(_helper.runtime_state.get(), *local_state, root_id);
+    ASSERT_TRUE(st.ok()) << "split build failed: " << st.to_string();
+    st = probe_operator->_split_probe_partition(_helper.runtime_state.get(), *local_state, root_id);
+    ASSERT_TRUE(st.ok()) << "split probe failed: " << st.to_string();
+
+    HashJoinSpillPartitionId child_id {};
+    bool found_child = false;
+    auto& partitions = shared_state->probe_partitions;
+    auto root_it = partitions.find(root_id.key());
+    ASSERT_TRUE(root_it != partitions.end());
+    for (const auto& candidate : root_it->second.children) {
+        auto child_it = partitions.find(candidate.key());
+        if (child_it != partitions.end() && child_it->second.spill_stream &&
+            child_it->second.spill_stream->get_written_bytes() > 0) {
+            child_id = candidate;
+            found_child = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_child);
+
+    st = probe_operator->_split_build_partition(_helper.runtime_state.get(), *local_state,
+                                                child_id);
+    ASSERT_TRUE(st.ok()) << "split build failed: " << st.to_string();
+    st = probe_operator->_split_probe_partition(_helper.runtime_state.get(), *local_state,
+                                                child_id);
+    ASSERT_TRUE(st.ok()) << "split probe failed: " << st.to_string();
+
+    HashJoinSpillPartitionId grandchild_id {};
+    bool found_grandchild = false;
+    auto child_it = partitions.find(child_id.key());
+    ASSERT_TRUE(child_it != partitions.end());
+    for (const auto& candidate : child_it->second.children) {
+        auto grandchild_it = partitions.find(candidate.key());
+        if (grandchild_it != partitions.end() && grandchild_it->second.spill_stream &&
+            grandchild_it->second.spill_stream->get_written_bytes() > 0) {
+            grandchild_id = candidate;
+            found_grandchild = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_grandchild);
+
+    auto& grandchild_build_partition = shared_state->build_partitions[grandchild_id.key()];
+    grandchild_build_partition.id = grandchild_id;
+    if (!grandchild_build_partition.build_block) {
+        grandchild_build_partition.build_block = vectorized::MutableBlock::create_unique(
+                vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({1}));
+    }
+
+    shared_state->is_spilled = true;
+    local_state->_need_to_setup_internal_operators = true;
+    local_state->_child_eos = true;
+    local_state->_partition_cursor = PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT;
+    local_state->_pending_partitions.clear();
+    local_state->_pending_partitions.emplace_back(grandchild_id);
+
+    vectorized::Block output_block;
+    bool eos = false;
+    st = probe_operator->get_block(_helper.runtime_state.get(), &output_block, &eos);
+    ASSERT_TRUE(st.ok()) << "get_block failed: " << st.to_string();
+    ASSERT_FALSE(eos);
+}
+
+TEST_F(PartitionedHashJoinProbeOperatorTest,
+       EndToEndProcessesSplitGrandchildFromBuildAndProbeSpillStreams) {
+    auto [probe_operator, sink_operator] = _helper.create_operators();
+
+    std::shared_ptr<MockPartitionedHashJoinSharedState> shared_state;
+    auto local_state = _helper.create_probe_local_state(_helper.runtime_state.get(),
+                                                        probe_operator.get(), shared_state);
+
+    RowDescriptor probe_row_desc(_helper.runtime_state->desc_tbl(), {0});
+    RowDescriptor build_row_desc(_helper.runtime_state->desc_tbl(), {1});
+    const auto& tnode = probe_operator->_tnode;
+    local_state->_partitioner = create_spill_partitioner(
+            _helper.runtime_state.get(), PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT,
+            {tnode.hash_join_node.eq_join_conjuncts[0].left}, probe_row_desc);
+    local_state->_build_partitioner = create_spill_partitioner(
+            _helper.runtime_state.get(), PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT,
+            {tnode.hash_join_node.eq_join_conjuncts[0].right}, build_row_desc);
+
+    std::vector<int32_t> values(4096);
+    std::iota(values.begin(), values.end(), 0);
+    vectorized::Block build_full_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>(values);
+    ASSERT_TRUE(local_state->_build_partitioner
+                        ->do_partitioning(_helper.runtime_state.get(), &build_full_block)
+                        .ok());
+    const auto* build_hashes = local_state->_build_partitioner->get_channel_ids().get<uint32_t>();
+
+    std::vector<int32_t> build_parent_values;
+    for (uint32_t i = 0; i < build_full_block.rows(); ++i) {
+        if (spill_partition_index(build_hashes[i], 0) == 0) {
+            build_parent_values.emplace_back(values[i]);
+        }
+    }
+    ASSERT_FALSE(build_parent_values.empty());
+    vectorized::Block build_parent_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>(build_parent_values);
+
+    vectorized::SpillStreamSPtr build_parent_stream;
+    auto st = ExecEnv::GetInstance()->spill_stream_mgr()->register_spill_stream(
+            _helper.runtime_state.get(), build_parent_stream,
+            print_id(_helper.runtime_state->query_id()), "hash_build_parent",
+            probe_operator->node_id(), std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<size_t>::max(), local_state->operator_profile());
+    ASSERT_TRUE(st) << "Register spill stream failed: " << st.to_string();
+    st = build_parent_stream->spill_block(_helper.runtime_state.get(), build_parent_block, false);
+    ASSERT_TRUE(st) << "Spill block failed: " << st.to_string();
+    st = build_parent_stream->spill_eof();
+    ASSERT_TRUE(st) << "Spill eof failed: " << st.to_string();
+
+    HashJoinSpillPartitionId build_partition_id {0, 0};
+    auto& build_partition = shared_state->build_partitions[build_partition_id.key()];
+    build_partition.spill_stream = build_parent_stream;
+
+    vectorized::Block probe_full_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>(values);
+    ASSERT_TRUE(local_state->_partitioner
+                        ->do_partitioning(_helper.runtime_state.get(), &probe_full_block)
+                        .ok());
+    const auto* probe_hashes = local_state->_partitioner->get_channel_ids().get<uint32_t>();
+
+    std::vector<int32_t> probe_parent_values;
+    for (uint32_t i = 0; i < probe_full_block.rows(); ++i) {
+        if (spill_partition_index(probe_hashes[i], 0) == 0) {
+            probe_parent_values.emplace_back(values[i]);
+        }
+    }
+    ASSERT_FALSE(probe_parent_values.empty());
+    vectorized::Block probe_parent_block =
+            vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>(probe_parent_values);
+
+    vectorized::SpillStreamSPtr probe_parent_stream;
+    st = ExecEnv::GetInstance()->spill_stream_mgr()->register_spill_stream(
+            _helper.runtime_state.get(), probe_parent_stream,
+            print_id(_helper.runtime_state->query_id()), "hash_probe_parent",
+            probe_operator->node_id(), std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<size_t>::max(), local_state->operator_profile());
+    ASSERT_TRUE(st) << "Register spill stream failed: " << st.to_string();
+    st = probe_parent_stream->spill_block(_helper.runtime_state.get(), probe_parent_block, false);
+    ASSERT_TRUE(st) << "Spill block failed: " << st.to_string();
+    st = probe_parent_stream->spill_eof();
+    ASSERT_TRUE(st) << "Spill eof failed: " << st.to_string();
+
+    HashJoinSpillPartitionId root_id {0, 0};
+    auto& root_probe_partition = shared_state->probe_partitions[root_id.key()];
+    root_probe_partition.id = root_id;
+    root_probe_partition.spill_stream = probe_parent_stream;
+
+    st = probe_operator->_split_build_partition(_helper.runtime_state.get(), *local_state, root_id);
+    ASSERT_TRUE(st.ok()) << "split build failed: " << st.to_string();
+    st = probe_operator->_split_probe_partition(_helper.runtime_state.get(), *local_state, root_id);
+    ASSERT_TRUE(st.ok()) << "split probe failed: " << st.to_string();
+
+    HashJoinSpillPartitionId child_id {};
+    bool found_child = false;
+    auto& probe_partitions = shared_state->probe_partitions;
+    auto root_it = probe_partitions.find(root_id.key());
+    ASSERT_TRUE(root_it != probe_partitions.end());
+    for (const auto& candidate : root_it->second.children) {
+        auto child_it = probe_partitions.find(candidate.key());
+        if (child_it != probe_partitions.end() && child_it->second.spill_stream &&
+            child_it->second.spill_stream->get_written_bytes() > 0) {
+            child_id = candidate;
+            found_child = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_child);
+
+    st = probe_operator->_split_build_partition(_helper.runtime_state.get(), *local_state,
+                                                child_id);
+    ASSERT_TRUE(st.ok()) << "split build failed: " << st.to_string();
+    st = probe_operator->_split_probe_partition(_helper.runtime_state.get(), *local_state,
+                                                child_id);
+    ASSERT_TRUE(st.ok()) << "split probe failed: " << st.to_string();
+
+    HashJoinSpillPartitionId grandchild_id {};
+    bool found_grandchild = false;
+    auto child_it = probe_partitions.find(child_id.key());
+    ASSERT_TRUE(child_it != probe_partitions.end());
+    for (const auto& candidate : child_it->second.children) {
+        auto grandchild_it = probe_partitions.find(candidate.key());
+        if (grandchild_it != probe_partitions.end() && grandchild_it->second.spill_stream &&
+            grandchild_it->second.spill_stream->get_written_bytes() > 0) {
+            grandchild_id = candidate;
+            found_grandchild = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_grandchild);
+
+    auto build_it = shared_state->build_partitions.find(grandchild_id.key());
+    ASSERT_TRUE(build_it != shared_state->build_partitions.end());
+    if (!build_it->second.build_block) {
+        build_it->second.build_block = vectorized::MutableBlock::create_unique(
+                vectorized::ColumnHelper::create_block<vectorized::DataTypeInt32>({1}));
+    }
+
+    shared_state->is_spilled = true;
+    local_state->_need_to_setup_internal_operators = true;
+    local_state->_child_eos = true;
+    local_state->_partition_cursor = PartitionedHashJoinTestHelper::TEST_PARTITION_COUNT;
+    local_state->_pending_partitions.clear();
+    local_state->_pending_partitions.emplace_back(grandchild_id);
+
+    vectorized::Block output_block;
+    bool eos = false;
+    st = probe_operator->get_block(_helper.runtime_state.get(), &output_block, &eos);
+    ASSERT_TRUE(st.ok()) << "get_block failed: " << st.to_string();
+    ASSERT_FALSE(eos);
 }
 
 TEST_F(PartitionedHashJoinProbeOperatorTest, Other) {

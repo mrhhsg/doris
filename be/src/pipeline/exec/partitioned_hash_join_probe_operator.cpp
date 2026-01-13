@@ -20,7 +20,9 @@
 #include <gen_cpp/Metrics_types.h>
 #include <glog/logging.h>
 
+#include <array>
 #include <memory>
+#include <unordered_map>
 #include <utility>
 
 #include "common/exception.h"
@@ -35,6 +37,48 @@
 
 namespace doris::pipeline {
 #include "common/compile_check_begin.h"
+namespace {
+inline uint32_t spill_partition_index(uint32_t hash, uint32_t level) {
+    return (hash >> (level * kHashJoinSpillBitsPerLevel)) & (kHashJoinSpillFanout - 1);
+}
+
+inline uint32_t base_partition_index(const HashJoinSpillPartitionId& id) {
+    return id.path & (kHashJoinSpillFanout - 1);
+}
+
+HashJoinSpillPartition& get_or_create_partition(HashJoinSpillPartitionMap& partitions,
+                                                const HashJoinSpillPartitionId& id) {
+    auto [it, inserted] = partitions.try_emplace(id.key());
+    if (inserted) {
+        it->second.id = id;
+    }
+    return it->second;
+}
+
+HashJoinSpillBuildPartition& get_or_create_build_partition(
+        HashJoinSpillBuildPartitionMap& partitions, const HashJoinSpillPartitionId& id) {
+    auto [it, inserted] = partitions.try_emplace(id.key());
+    if (inserted) {
+        it->second.id = id;
+    }
+    return it->second;
+}
+
+HashJoinSpillPartitionId find_partition_for_hash(
+        uint32_t hash, const HashJoinSpillBuildPartitionMap& build_partitions) {
+    // Follow build-side split hierarchy so probe rows land in the final partition.
+    HashJoinSpillPartitionId id {0, spill_partition_index(hash, 0)};
+    auto it = build_partitions.find(id.key());
+    while (it != build_partitions.end() && it->second.is_split &&
+           id.level < kHashJoinSpillMaxDepth) {
+        const auto child_index = spill_partition_index(hash, id.level + 1);
+        id = id.child(child_index);
+        it = build_partitions.find(id.key());
+    }
+    return id;
+}
+
+} // namespace
 
 PartitionedHashJoinProbeLocalState::PartitionedHashJoinProbeLocalState(RuntimeState* state,
                                                                        OperatorXBase* parent)
@@ -50,8 +94,19 @@ Status PartitionedHashJoinProbeLocalState::init(RuntimeState* state, LocalStateI
     _internal_runtime_profile = std::make_unique<RuntimeProfile>("internal_profile");
     auto& p = _parent->cast<PartitionedHashJoinProbeOperatorX>();
 
-    _partitioned_blocks.resize(p._partition_count);
-    _probe_spilling_streams.resize(p._partition_count);
+    _base_partition_split.assign(p._partition_count, false);
+    _pending_partitions.clear();
+    _has_current_partition = false;
+    _current_partition_id = {};
+    auto& partitions = _shared_state->probe_partitions;
+    partitions.clear();
+    auto& build_partitions = _shared_state->build_partitions;
+    build_partitions.clear();
+    for (uint32_t i = 0; i < p._partition_count; ++i) {
+        HashJoinSpillPartitionId id {0, i};
+        get_or_create_partition(partitions, id);
+        get_or_create_build_partition(build_partitions, id);
+    }
     init_counters();
     return Status::OK();
 }
@@ -77,6 +132,11 @@ void PartitionedHashJoinProbeLocalState::init_counters() {
             ADD_COUNTER_WITH_LEVEL(custom_profile(), "ProbeBloksBytesInMem", TUnit::BYTES, 1);
     _memory_usage_reserved =
             ADD_COUNTER_WITH_LEVEL(custom_profile(), "MemoryUsageReserved", TUnit::BYTES, 1);
+
+    _probe_partition_splits =
+            ADD_COUNTER_WITH_LEVEL(custom_profile(), "ProbePartitionSplits", TUnit::UNIT, 1);
+    _build_partition_splits =
+            ADD_COUNTER_WITH_LEVEL(custom_profile(), "BuildPartitionSplits", TUnit::UNIT, 1);
 }
 
 template <bool spilled>
@@ -152,8 +212,12 @@ void PartitionedHashJoinProbeLocalState::update_profile_from_inner() {
 
 Status PartitionedHashJoinProbeLocalState::open(RuntimeState* state) {
     RETURN_IF_ERROR(PipelineXSpillLocalState::open(state));
-    return _parent->cast<PartitionedHashJoinProbeOperatorX>()._partitioner->clone(state,
-                                                                                  _partitioner);
+    auto& p = _parent->cast<PartitionedHashJoinProbeOperatorX>();
+    RETURN_IF_ERROR(p._partitioner->clone(state, _partitioner));
+    if (p._build_partitioner) {
+        RETURN_IF_ERROR(p._build_partitioner->clone(state, _build_partitioner));
+    }
+    return Status::OK();
 }
 Status PartitionedHashJoinProbeLocalState::close(RuntimeState* state) {
     SCOPED_TIMER(exec_time_counter());
@@ -173,25 +237,23 @@ Status PartitionedHashJoinProbeLocalState::spill_probe_blocks(RuntimeState* stat
 
         size_t not_revoked_size = 0;
         auto& p = _parent->cast<PartitionedHashJoinProbeOperatorX>();
-        for (uint32_t partition_index = 0; partition_index != p._partition_count;
-             ++partition_index) {
-            auto& blocks = _probe_blocks[partition_index];
-            auto& partitioned_block = _partitioned_blocks[partition_index];
-            if (partitioned_block) {
-                const auto size = partitioned_block->allocated_bytes();
+        auto spill_partition = [&](std::vector<vectorized::Block>& blocks,
+                                   std::unique_ptr<vectorized::MutableBlock>& accumulating_block,
+                                   vectorized::SpillStreamSPtr& spilling_stream) -> Status {
+            if (accumulating_block) {
+                const auto size = accumulating_block->allocated_bytes();
                 if (size >= vectorized::SpillStream::MIN_SPILL_WRITE_BATCH_MEM) {
-                    blocks.emplace_back(partitioned_block->to_block());
-                    partitioned_block.reset();
+                    blocks.emplace_back(accumulating_block->to_block());
+                    accumulating_block.reset();
                 } else {
                     not_revoked_size += size;
                 }
             }
 
             if (blocks.empty()) {
-                continue;
+                return Status::OK();
             }
 
-            auto& spilling_stream = _probe_spilling_streams[partition_index];
             if (!spilling_stream) {
                 RETURN_IF_ERROR(ExecEnv::GetInstance()->spill_stream_mgr()->register_spill_stream(
                         state, spilling_stream, print_id(state->query_id()), "hash_probe",
@@ -220,6 +282,14 @@ Status PartitionedHashJoinProbeLocalState::spill_probe_blocks(RuntimeState* stat
                         spilling_stream->spill_block(state, merged_block->to_block(), false));
                 COUNTER_UPDATE(_spill_probe_blocks, 1);
             }
+            return Status::OK();
+        };
+
+        // Spill all probe partitions from unified storage
+        auto& partitions = _shared_state->probe_partitions;
+        for (auto& [_, partition] : partitions) {
+            RETURN_IF_ERROR(spill_partition(partition.blocks, partition.accumulating_block,
+                                            partition.spill_stream));
         }
 
         COUNTER_SET(_probe_blocks_bytes, int64_t(not_revoked_size));
@@ -255,9 +325,20 @@ Status PartitionedHashJoinProbeLocalState::spill_probe_blocks(RuntimeState* stat
 }
 
 Status PartitionedHashJoinProbeLocalState::finish_spilling(uint32_t partition_index) {
-    auto& probe_spilling_stream = _probe_spilling_streams[partition_index];
+    return finish_spilling(HashJoinSpillPartitionId {.level = 0, .path = partition_index});
+}
 
-    if (probe_spilling_stream) {
+Status PartitionedHashJoinProbeLocalState::finish_spilling(
+        const HashJoinSpillPartitionId& partition_id) {
+    // Always read from probe_partitions
+    vectorized::SpillStreamSPtr probe_spilling_stream;
+    auto& partitions = _shared_state->probe_partitions;
+    auto it = partitions.find(partition_id.key());
+    if (it != partitions.end()) {
+        probe_spilling_stream = it->second.spill_stream;
+    }
+
+    if (probe_spilling_stream && !probe_spilling_stream->ready_for_reading()) {
         RETURN_IF_ERROR(probe_spilling_stream->spill_eof());
         probe_spilling_stream->set_read_counters(operator_profile());
     }
@@ -268,27 +349,40 @@ Status PartitionedHashJoinProbeLocalState::finish_spilling(uint32_t partition_in
 Status PartitionedHashJoinProbeLocalState::recover_build_blocks_from_disk(RuntimeState* state,
                                                                           uint32_t partition_index,
                                                                           bool& has_data) {
+    return recover_build_blocks_from_disk(
+            state, HashJoinSpillPartitionId {.level = 0, .path = partition_index}, has_data);
+}
+
+Status PartitionedHashJoinProbeLocalState::recover_build_blocks_from_disk(
+        RuntimeState* state, const HashJoinSpillPartitionId& partition_id, bool& has_data) {
     VLOG_DEBUG << fmt::format(
             "Query:{}, hash join probe:{}, task:{},"
             " partition:{}, recover_build_blocks_from_disk",
-            print_id(state->query_id()), _parent->node_id(), state->task_id(), partition_index);
-    auto& spilled_stream = _shared_state->spilled_streams[partition_index];
+            print_id(state->query_id()), _parent->node_id(), state->task_id(),
+            base_partition_index(partition_id));
+    // Always read from build_partitions.
+    vectorized::SpillStreamSPtr* spilled_stream = nullptr;
+    auto it = _shared_state->build_partitions.find(partition_id.key());
+    if (it != _shared_state->build_partitions.end()) {
+        spilled_stream = &it->second.spill_stream;
+    }
     has_data = false;
-    if (!spilled_stream) {
+    if (!spilled_stream || !*spilled_stream) {
         return Status::OK();
     }
-    spilled_stream->set_read_counters(operator_profile());
+    (*spilled_stream)->set_read_counters(operator_profile());
 
     auto query_id = state->query_id();
 
-    auto read_func = [this, query_id, state, spilled_stream = spilled_stream, partition_index] {
+    auto read_func = [this, query_id, state, spilled_stream, partition_id] {
         SCOPED_TIMER(_recovery_build_timer);
 
         bool eos = false;
         VLOG_DEBUG << fmt::format(
                 "Query:{}, hash join probe:{}, task:{},"
                 " partition:{}, recoverying build data",
-                print_id(state->query_id()), _parent->node_id(), state->task_id(), partition_index);
+                print_id(state->query_id()), _parent->node_id(), state->task_id(),
+                base_partition_index(partition_id));
         Status status;
         while (!eos) {
             vectorized::Block block;
@@ -298,7 +392,7 @@ Status PartitionedHashJoinProbeLocalState::recover_build_blocks_from_disk(Runtim
                         "recover_build_blocks failed");
             });
             if (status.ok()) {
-                status = spilled_stream->read_next_block_sync(&block, &eos);
+                status = (*spilled_stream)->read_next_block_sync(&block, &eos);
             }
             if (!status.ok()) {
                 break;
@@ -315,7 +409,7 @@ Status PartitionedHashJoinProbeLocalState::recover_build_blocks_from_disk(Runtim
                         "Query:{}, hash join probe:{}, task:{},"
                         " partition:{}, recovery build data canceled",
                         print_id(state->query_id()), _parent->node_id(), state->task_id(),
-                        partition_index);
+                        base_partition_index(partition_id));
                 break;
             }
 
@@ -336,13 +430,13 @@ Status PartitionedHashJoinProbeLocalState::recover_build_blocks_from_disk(Runtim
         }
 
         if (eos) {
-            ExecEnv::GetInstance()->spill_stream_mgr()->delete_spill_stream(spilled_stream);
-            _shared_state->spilled_streams[partition_index].reset();
+            ExecEnv::GetInstance()->spill_stream_mgr()->delete_spill_stream(*spilled_stream);
+            spilled_stream->reset();
             VLOG_DEBUG << fmt::format(
                     "Query:{}, hash join probe:{}, task:{},"
                     " partition:{}, recovery build data eos",
                     print_id(state->query_id()), _parent->node_id(), state->task_id(),
-                    partition_index);
+                    base_partition_index(partition_id));
         }
         return status;
     };
@@ -403,18 +497,32 @@ std::string PartitionedHashJoinProbeLocalState::debug_string(int indentation_lev
 Status PartitionedHashJoinProbeLocalState::recover_probe_blocks_from_disk(RuntimeState* state,
                                                                           uint32_t partition_index,
                                                                           bool& has_data) {
-    auto& spilled_stream = _probe_spilling_streams[partition_index];
+    return recover_probe_blocks_from_disk(state, HashJoinSpillPartitionId {0, partition_index},
+                                          has_data);
+}
+
+Status PartitionedHashJoinProbeLocalState::recover_probe_blocks_from_disk(
+        RuntimeState* state, const HashJoinSpillPartitionId& partition_id, bool& has_data) {
+    // Always read from probe_partitions
+    vectorized::SpillStreamSPtr* spilled_stream = nullptr;
+    std::vector<vectorized::Block>* blocks = nullptr;
+    auto& partitions = _shared_state->probe_partitions;
+    auto it = partitions.find(partition_id.key());
+    if (it != partitions.end()) {
+        spilled_stream = &it->second.spill_stream;
+        blocks = &it->second.blocks;
+    }
+
     has_data = false;
-    if (!spilled_stream) {
+    if (!spilled_stream || !*spilled_stream || !blocks) {
         return Status::OK();
     }
 
-    spilled_stream->set_read_counters(operator_profile());
-    auto& blocks = _probe_blocks[partition_index];
+    (*spilled_stream)->set_read_counters(operator_profile());
 
     auto query_id = state->query_id();
 
-    auto read_func = [this, query_id, partition_index, &spilled_stream, &blocks] {
+    auto read_func = [this, query_id, partition_id, spilled_stream, blocks] {
         SCOPED_TIMER(_recovery_probe_timer);
 
         vectorized::Block block;
@@ -427,14 +535,14 @@ Status PartitionedHashJoinProbeLocalState::recover_probe_blocks_from_disk(Runtim
 
         size_t read_size = 0;
         while (!eos && !_state->is_cancelled() && st.ok()) {
-            st = spilled_stream->read_next_block_sync(&block, &eos);
+            st = (*spilled_stream)->read_next_block_sync(&block, &eos);
             if (!st.ok()) {
                 break;
             } else if (!block.empty()) {
                 COUNTER_UPDATE(_recovery_probe_rows, block.rows());
                 COUNTER_UPDATE(_recovery_probe_blocks, 1);
                 read_size += block.allocated_bytes();
-                blocks.emplace_back(std::move(block));
+                blocks->emplace_back(std::move(block));
             }
 
             if (read_size >= vectorized::SpillStream::MAX_SPILL_WRITE_BATCH_MEM) {
@@ -445,9 +553,10 @@ Status PartitionedHashJoinProbeLocalState::recover_probe_blocks_from_disk(Runtim
             VLOG_DEBUG << fmt::format(
                     "Query:{}, hash join probe:{}, task:{},"
                     " partition:{}, recovery probe data done",
-                    print_id(query_id), _parent->node_id(), _state->task_id(), partition_index);
-            ExecEnv::GetInstance()->spill_stream_mgr()->delete_spill_stream(spilled_stream);
-            spilled_stream.reset();
+                    print_id(query_id), _parent->node_id(), _state->task_id(),
+                    base_partition_index(partition_id));
+            ExecEnv::GetInstance()->spill_stream_mgr()->delete_spill_stream(*spilled_stream);
+            spilled_stream->reset();
         }
         return st;
     };
@@ -496,19 +605,23 @@ PartitionedHashJoinProbeOperatorX::PartitionedHashJoinProbeOperatorX(ObjectPool*
                                                 : std::vector<TExpr> {}),
           _tnode(tnode),
           _descriptor_tbl(descs),
-          _partition_count(partition_count) {}
+          _partition_count(kHashJoinSpillFanout) {}
 
 Status PartitionedHashJoinProbeOperatorX::init(const TPlanNode& tnode, RuntimeState* state) {
     RETURN_IF_ERROR(JoinProbeOperatorX::init(tnode, state));
     _op_name = "PARTITIONED_HASH_JOIN_PROBE_OPERATOR";
+    DCHECK_EQ(_partition_count, kHashJoinSpillFanout);
     auto tnode_ = _tnode;
     tnode_.runtime_filters.clear();
 
     for (const auto& conjunct : tnode.hash_join_node.eq_join_conjuncts) {
         _probe_exprs.emplace_back(conjunct.left);
+        _build_exprs.emplace_back(conjunct.right);
     }
-    _partitioner = std::make_unique<SpillPartitionerType>(_partition_count);
+    _partitioner = std::make_unique<SpillHashPartitionerType>(_partition_count);
     RETURN_IF_ERROR(_partitioner->init(_probe_exprs));
+    _build_partitioner = std::make_unique<SpillHashPartitionerType>(_partition_count);
+    RETURN_IF_ERROR(_build_partitioner->init(_build_exprs));
 
     return Status::OK();
 }
@@ -526,6 +639,10 @@ Status PartitionedHashJoinProbeOperatorX::prepare(RuntimeState* state) {
     _child = std::move(child);
     RETURN_IF_ERROR(_partitioner->prepare(state, _child->row_desc()));
     RETURN_IF_ERROR(_partitioner->open(state));
+    if (_build_partitioner) {
+        RETURN_IF_ERROR(_build_partitioner->prepare(state, _build_side_child->row_desc()));
+        RETURN_IF_ERROR(_build_partitioner->open(state));
+    }
     return Status::OK();
 }
 
@@ -533,13 +650,14 @@ Status PartitionedHashJoinProbeOperatorX::push(RuntimeState* state, vectorized::
                                                bool eos) const {
     auto& local_state = get_local_state(state);
     const auto rows = input_block->rows();
-    auto& partitioned_blocks = local_state._partitioned_blocks;
     if (rows == 0) {
         if (eos) {
-            for (uint32_t i = 0; i != _partition_count; ++i) {
-                if (partitioned_blocks[i] && !partitioned_blocks[i]->empty()) {
-                    local_state._probe_blocks[i].emplace_back(partitioned_blocks[i]->to_block());
-                    partitioned_blocks[i].reset();
+            // Flush all accumulating blocks from unified probe_partitions storage
+            auto& partitions = local_state._shared_state->probe_partitions;
+            for (auto& [_, partition] : partitions) {
+                if (partition.accumulating_block && !partition.accumulating_block->empty()) {
+                    partition.blocks.emplace_back(partition.accumulating_block->to_block());
+                    partition.accumulating_block.reset();
                 }
             }
         }
@@ -550,36 +668,59 @@ Status PartitionedHashJoinProbeOperatorX::push(RuntimeState* state, vectorized::
         RETURN_IF_ERROR(local_state._partitioner->do_partitioning(state, input_block));
     }
 
-    std::vector<std::vector<uint32_t>> partition_indexes(_partition_count);
     const auto* channel_ids = local_state._partitioner->get_channel_ids().get<uint32_t>();
+    // Build-side split decisions determine the final probe partition target.
+    auto& build_partitions = local_state._shared_state->build_partitions;
+    struct PartitionRowIndexes {
+        HashJoinSpillPartitionId id;
+        std::vector<uint32_t> row_indexes;
+    };
+    // Group rows by final partition (base or split child).
+    std::unordered_map<uint32_t, PartitionRowIndexes> partition_indexes;
+    partition_indexes.reserve(rows);
     for (uint32_t i = 0; i != rows; ++i) {
-        partition_indexes[channel_ids[i]].emplace_back(i);
+        auto id = find_partition_for_hash(channel_ids[i], build_partitions);
+        auto [it, inserted] = partition_indexes.try_emplace(
+                id.key(), PartitionRowIndexes {.id = id, .row_indexes = {}});
+        it->second.row_indexes.emplace_back(i);
     }
 
     SCOPED_TIMER(local_state._partition_shuffle_timer);
-    int64_t bytes_of_blocks = 0;
-    for (uint32_t i = 0; i != _partition_count; ++i) {
-        const auto count = partition_indexes[i].size();
-        if (UNLIKELY(count == 0)) {
-            continue;
+    auto append_rows = [&](std::unique_ptr<vectorized::MutableBlock>& accumulating_block,
+                           std::vector<vectorized::Block>& blocks,
+                           const std::vector<uint32_t>& row_indexes) -> Status {
+        if (row_indexes.empty()) {
+            return Status::OK();
         }
-
-        if (!partitioned_blocks[i]) {
-            partitioned_blocks[i] =
+        if (!accumulating_block) {
+            accumulating_block =
                     vectorized::MutableBlock::create_unique(input_block->clone_empty());
         }
-        RETURN_IF_ERROR(partitioned_blocks[i]->add_rows(input_block, partition_indexes[i].data(),
-                                                        partition_indexes[i].data() + count));
-
-        if (partitioned_blocks[i]->rows() > 2 * 1024 * 1024 ||
-            (eos && partitioned_blocks[i]->rows() > 0)) {
-            local_state._probe_blocks[i].emplace_back(partitioned_blocks[i]->to_block());
-            partitioned_blocks[i].reset();
-        } else {
-            bytes_of_blocks += partitioned_blocks[i]->allocated_bytes();
+        RETURN_IF_ERROR(accumulating_block->add_rows(input_block, row_indexes.data(),
+                                                     row_indexes.data() + row_indexes.size()));
+        if (accumulating_block->rows() > 2 * 1024 * 1024 ||
+            (eos && accumulating_block->rows() > 0)) {
+            blocks.emplace_back(accumulating_block->to_block());
+            accumulating_block.reset();
         }
+        return Status::OK();
+    };
 
-        for (auto& block : local_state._probe_blocks[i]) {
+    auto& partitions = local_state._shared_state->probe_partitions;
+    for (auto& [_, entry] : partition_indexes) {
+        // Always write to probe_partitions for both base and split levels
+        auto& partition = get_or_create_partition(partitions, entry.id);
+        RETURN_IF_ERROR(
+                append_rows(partition.accumulating_block, partition.blocks, entry.row_indexes));
+    }
+
+    // Calculate bytes from unified probe_partitions storage
+    int64_t bytes_of_blocks = 0;
+    for (auto& [_, partition] : partitions) {
+        if (partition.accumulating_block) {
+            bytes_of_blocks += partition.accumulating_block->allocated_bytes();
+        }
+        for (auto& block : partition.blocks) {
             bytes_of_blocks += block.allocated_bytes();
         }
     }
@@ -633,12 +774,14 @@ Status PartitionedHashJoinProbeOperatorX::_setup_internal_operators(
     DCHECK(probe_local_state != nullptr);
     RETURN_IF_ERROR(probe_local_state->open(state));
 
-    auto& partitioned_block =
-            local_state._shared_state->partitioned_build_blocks[local_state._partition_cursor];
+    const auto partition_index = base_partition_index(local_state._current_partition_id);
     vectorized::Block block;
-    if (partitioned_block && partitioned_block->rows() > 0) {
-        block = partitioned_block->to_block();
-        partitioned_block.reset();
+    // Always read from build_partitions for both base and split levels.
+    auto& build_partition = get_or_create_build_partition(
+            local_state._shared_state->build_partitions, local_state._current_partition_id);
+    if (build_partition.build_block && build_partition.build_block->rows() > 0) {
+        block = build_partition.build_block->to_block();
+        build_partition.build_block.reset();
     }
     DBUG_EXECUTE_IF("fault_inject::partitioned_hash_join_probe::sink", {
         return Status::Error<INTERNAL_ERROR>(
@@ -650,56 +793,406 @@ Status PartitionedHashJoinProbeOperatorX::_setup_internal_operators(
     VLOG_DEBUG << fmt::format(
             "Query:{}, hash join probe:{}, task:{},"
             " internal build operator finished, partition:{}, rows:{}, memory usage:{}",
-            print_id(state->query_id()), node_id(), state->task_id(), local_state._partition_cursor,
-            block.rows(),
+            print_id(state->query_id()), node_id(), state->task_id(), partition_index, block.rows(),
             _inner_sink_operator->get_memory_usage(
                     local_state._shared_state->inner_runtime_state.get()));
+    return Status::OK();
+}
+
+size_t PartitionedHashJoinProbeOperatorX::_build_partition_bytes(
+        const PartitionedHashJoinProbeLocalState& local_state,
+        const HashJoinSpillPartitionId& partition_id) const {
+    // Always read from build_partitions for both base and split levels.
+    auto& partitions = local_state._shared_state->build_partitions;
+    auto it = partitions.find(partition_id.key());
+    if (it == partitions.end()) {
+        return 0;
+    }
+    size_t bytes = 0;
+    if (it->second.build_block) {
+        bytes += it->second.build_block->allocated_bytes();
+    }
+    if (it->second.spill_stream) {
+        bytes += it->second.spill_stream->get_written_bytes();
+    }
+    return bytes;
+}
+
+Status PartitionedHashJoinProbeOperatorX::_maybe_split_build_partition(
+        RuntimeState* state, PartitionedHashJoinProbeLocalState& local_state) const {
+    if (!local_state._shared_state->is_spilled || !local_state.low_memory_mode()) {
+        return Status::OK();
+    }
+
+    const auto& partition_id = local_state._current_partition_id;
+    if (partition_id.level >= kHashJoinSpillMaxDepth) {
+        return Status::OK();
+    }
+
+    auto& build_partitions = local_state._shared_state->build_partitions;
+    auto& build_partition = get_or_create_build_partition(build_partitions, partition_id);
+    if (build_partition.is_split) {
+        return Status::OK();
+    }
+
+    const auto bytes = _build_partition_bytes(local_state, partition_id);
+    if (bytes < static_cast<size_t>(state->low_memory_mode_buffer_limit())) {
+        return Status::OK();
+    }
+
+    RETURN_IF_ERROR(_split_build_partition(state, local_state, partition_id));
+    RETURN_IF_ERROR(local_state.finish_spilling(partition_id));
+    RETURN_IF_ERROR(_split_probe_partition(state, local_state, partition_id));
+    local_state._has_current_partition = false;
+    return Status::OK();
+}
+
+Status PartitionedHashJoinProbeOperatorX::_split_probe_partition(
+        RuntimeState* state, PartitionedHashJoinProbeLocalState& local_state,
+        const HashJoinSpillPartitionId& partition_id) const {
+    if (partition_id.level >= kHashJoinSpillMaxDepth) {
+        return Status::OK();
+    }
+    // Repartition probe rows to follow build split; handles in-memory and spilled data.
+    std::vector<vectorized::Block> blocks;
+    vectorized::SpillStreamSPtr parent_stream;
+    // Always read from probe_partitions
+    auto& partitions = local_state._shared_state->probe_partitions;
+    auto it = partitions.find(partition_id.key());
+    if (it != partitions.end()) {
+        auto& partition = it->second;
+        if (partition.accumulating_block && !partition.accumulating_block->empty()) {
+            blocks.emplace_back(partition.accumulating_block->to_block());
+            partition.accumulating_block.reset();
+        }
+        while (!partition.blocks.empty()) {
+            blocks.emplace_back(std::move(partition.blocks.back()));
+            partition.blocks.pop_back();
+        }
+        parent_stream = partition.spill_stream;
+        partition.spill_stream.reset();
+        if (partition_id.level == 0) {
+            local_state._base_partition_split[partition_id.path] = true;
+        }
+    }
+
+    if (blocks.empty() && !parent_stream) {
+        return Status::OK();
+    }
+
+    std::array<std::unique_ptr<vectorized::MutableBlock>, kHashJoinSpillFanout> child_blocks;
+    std::array<vectorized::SpillStreamSPtr, kHashJoinSpillFanout> child_streams;
+    const bool spill_children = parent_stream != nullptr;
+
+    auto partition_block = [&](vectorized::Block& block) -> Status {
+        // Partition by hash-only channel ids and route to child partitions.
+        RETURN_IF_ERROR(local_state._partitioner->do_partitioning(state, &block));
+
+        std::vector<std::vector<uint32_t>> partition_indexes(kHashJoinSpillFanout);
+        const auto* hashes = local_state._partitioner->get_channel_ids().get<uint32_t>();
+        for (uint32_t i = 0; i < block.rows(); ++i) {
+            const auto child_index = spill_partition_index(hashes[i], partition_id.level + 1);
+            partition_indexes[child_index].emplace_back(i);
+        }
+
+        for (uint32_t i = 0; i < kHashJoinSpillFanout; ++i) {
+            const auto count = partition_indexes[i].size();
+            if (count == 0) {
+                continue;
+            }
+            if (!child_blocks[i]) {
+                child_blocks[i] = vectorized::MutableBlock::create_unique(block.clone_empty());
+            }
+            RETURN_IF_ERROR(child_blocks[i]->add_rows(&block, partition_indexes[i].data(),
+                                                      partition_indexes[i].data() + count));
+            if (spill_children) {
+                if (!child_streams[i]) {
+                    RETURN_IF_ERROR(
+                            ExecEnv::GetInstance()->spill_stream_mgr()->register_spill_stream(
+                                    state, child_streams[i], print_id(state->query_id()),
+                                    "hash_probe_split", node_id(),
+                                    std::numeric_limits<int32_t>::max(),
+                                    std::numeric_limits<size_t>::max(),
+                                    local_state.operator_profile()));
+                }
+                RETURN_IF_ERROR(
+                        child_streams[i]->spill_block(state, child_blocks[i]->to_block(), false));
+                child_blocks[i].reset();
+            }
+        }
+        return Status::OK();
+    };
+
+    for (auto& block : blocks) {
+        RETURN_IF_ERROR(partition_block(block));
+    }
+
+    if (parent_stream) {
+        // Read parent spill stream and repartition into child streams.
+        parent_stream->set_read_counters(local_state.operator_profile());
+        bool eos = false;
+        while (!eos) {
+            vectorized::Block block;
+            RETURN_IF_ERROR(parent_stream->read_next_block_sync(&block, &eos));
+            if (block.empty()) {
+                continue;
+            }
+            RETURN_IF_ERROR(partition_block(block));
+        }
+        ExecEnv::GetInstance()->spill_stream_mgr()->delete_spill_stream(parent_stream);
+    }
+
+    auto& parent = get_or_create_partition(partitions, partition_id);
+    parent.is_split = true;
+    parent.children.clear();
+    COUNTER_UPDATE(local_state._probe_partition_splits, 1);
+    // Materialize child partitions and enqueue them for processing.
+    for (uint32_t i = 0; i < kHashJoinSpillFanout; ++i) {
+        if (!child_blocks[i] && !child_streams[i]) {
+            continue;
+        }
+        auto child_id = partition_id.child(i);
+        auto& child_partition = get_or_create_partition(partitions, child_id);
+        if (child_blocks[i]) {
+            child_partition.blocks.emplace_back(child_blocks[i]->to_block());
+        }
+        if (child_streams[i]) {
+            RETURN_IF_ERROR(child_streams[i]->spill_eof());
+            child_partition.spill_stream = std::move(child_streams[i]);
+        }
+        parent.children.emplace_back(child_id);
+        local_state._pending_partitions.emplace_back(child_id);
+    }
+
+    // Calculate bytes from unified probe_partitions storage
+    size_t bytes = 0;
+    for (const auto& [_, partition] : local_state._shared_state->probe_partitions) {
+        if (partition.accumulating_block) {
+            bytes += partition.accumulating_block->allocated_bytes();
+        }
+        for (const auto& block : partition.blocks) {
+            bytes += block.allocated_bytes();
+        }
+    }
+    COUNTER_SET(local_state._probe_blocks_bytes, int64_t(bytes));
+    return Status::OK();
+}
+
+Status PartitionedHashJoinProbeOperatorX::_split_build_partition(
+        RuntimeState* state, PartitionedHashJoinProbeLocalState& local_state,
+        const HashJoinSpillPartitionId& partition_id) const {
+    if (partition_id.level >= kHashJoinSpillMaxDepth) {
+        return Status::OK();
+    }
+    DCHECK(local_state._build_partitioner);
+
+    // Split build partition to avoid oversized hash tables.
+    auto& build_partitions = local_state._shared_state->build_partitions;
+    auto& parent = get_or_create_build_partition(build_partitions, partition_id);
+    if (parent.is_split) {
+        return Status::OK();
+    }
+
+    std::vector<vectorized::Block> blocks;
+    vectorized::SpillStreamSPtr parent_stream;
+    // Always read from build_partitions.
+    if (parent.build_block && !parent.build_block->empty()) {
+        blocks.emplace_back(parent.build_block->to_block());
+        parent.build_block.reset();
+    }
+    parent_stream = parent.spill_stream;
+    parent.spill_stream.reset();
+
+    if (blocks.empty() && !parent_stream) {
+        return Status::OK();
+    }
+
+    std::array<std::unique_ptr<vectorized::MutableBlock>, kHashJoinSpillFanout> child_blocks;
+    std::array<vectorized::SpillStreamSPtr, kHashJoinSpillFanout> child_streams;
+    const bool spill_children = parent_stream != nullptr;
+
+    auto partition_block = [&](vectorized::Block& block) -> Status {
+        // Partition by build keys into child build partitions.
+        RETURN_IF_ERROR(local_state._build_partitioner->do_partitioning(state, &block));
+
+        std::vector<std::vector<uint32_t>> partition_indexes(kHashJoinSpillFanout);
+        const auto* hashes = local_state._build_partitioner->get_channel_ids().get<uint32_t>();
+        for (uint32_t i = 0; i < block.rows(); ++i) {
+            const auto child_index = spill_partition_index(hashes[i], partition_id.level + 1);
+            partition_indexes[child_index].emplace_back(i);
+        }
+
+        for (uint32_t i = 0; i < kHashJoinSpillFanout; ++i) {
+            const auto count = partition_indexes[i].size();
+            if (count == 0) {
+                continue;
+            }
+            if (!child_blocks[i]) {
+                child_blocks[i] = vectorized::MutableBlock::create_unique(block.clone_empty());
+            }
+            RETURN_IF_ERROR(child_blocks[i]->add_rows(&block, partition_indexes[i].data(),
+                                                      partition_indexes[i].data() + count));
+            if (spill_children) {
+                if (!child_streams[i]) {
+                    RETURN_IF_ERROR(
+                            ExecEnv::GetInstance()->spill_stream_mgr()->register_spill_stream(
+                                    state, child_streams[i], print_id(state->query_id()),
+                                    "hash_build_split", node_id(),
+                                    std::numeric_limits<int32_t>::max(),
+                                    std::numeric_limits<size_t>::max(),
+                                    local_state.operator_profile()));
+                }
+                RETURN_IF_ERROR(
+                        child_streams[i]->spill_block(state, child_blocks[i]->to_block(), false));
+                child_blocks[i].reset();
+            }
+        }
+        return Status::OK();
+    };
+
+    for (auto& block : blocks) {
+        RETURN_IF_ERROR(partition_block(block));
+    }
+
+    if (parent_stream) {
+        // Repartition spilled build data into child spill streams.
+        parent_stream->set_read_counters(local_state.operator_profile());
+        bool eos = false;
+        while (!eos) {
+            vectorized::Block block;
+            RETURN_IF_ERROR(parent_stream->read_next_block_sync(&block, &eos));
+            if (block.empty()) {
+                continue;
+            }
+            RETURN_IF_ERROR(partition_block(block));
+        }
+        ExecEnv::GetInstance()->spill_stream_mgr()->delete_spill_stream(parent_stream);
+    }
+
+    parent.is_split = true;
+    parent.children.clear();
+    COUNTER_UPDATE(local_state._build_partition_splits, 1);
+    // Persist child partitions for later processing.
+    for (uint32_t i = 0; i < kHashJoinSpillFanout; ++i) {
+        if (!child_blocks[i] && !child_streams[i]) {
+            continue;
+        }
+        auto child_id = partition_id.child(i);
+        auto& child = get_or_create_build_partition(build_partitions, child_id);
+        if (child_blocks[i]) {
+            child.build_block = std::move(child_blocks[i]);
+        }
+        if (child_streams[i]) {
+            RETURN_IF_ERROR(child_streams[i]->spill_eof());
+            child.spill_stream = std::move(child_streams[i]);
+        }
+        parent.children.emplace_back(child_id);
+    }
+
+    return Status::OK();
+}
+
+Status PartitionedHashJoinProbeOperatorX::_select_partition_if_needed(
+        PartitionedHashJoinProbeLocalState& local_state, bool* eos) const {
+    *eos = false;
+    if (local_state._has_current_partition) {
+        return Status::OK();
+    }
+
+    // Prefer split children, then advance through base partitions.
+    if (!local_state._pending_partitions.empty()) {
+        local_state._current_partition_id = local_state._pending_partitions.front();
+        local_state._pending_partitions.pop_front();
+    } else {
+        if (local_state._partition_cursor >= _partition_count) {
+            *eos = true;
+            return Status::OK();
+        }
+        if (local_state._base_partition_split[local_state._partition_cursor]) {
+            local_state._partition_cursor++;
+            if (local_state._partition_cursor >= _partition_count) {
+                *eos = true;
+                return Status::OK();
+            }
+        }
+        local_state._current_partition_id =
+                HashJoinSpillPartitionId {.level = 0, .path = local_state._partition_cursor};
+    }
+    local_state._partition_cursor = base_partition_index(local_state._current_partition_id);
+    local_state._has_current_partition = true;
+    return Status::OK();
+}
+
+Status PartitionedHashJoinProbeOperatorX::_prepare_hash_table(
+        RuntimeState* state, PartitionedHashJoinProbeLocalState& local_state,
+        bool* need_wait) const {
+    *need_wait = false;
+    if (!local_state._need_to_setup_internal_operators) {
+        return Status::OK();
+    }
+
+    // Merge any recovered build batch back into its partition buffer.
+    if (local_state._recovered_build_block && !local_state._recovered_build_block->empty()) {
+        local_state._estimate_memory_usage += local_state._recovered_build_block->allocated_bytes();
+        // Always use build_partitions for both base and split levels.
+        auto& build_partition = get_or_create_build_partition(
+                local_state._shared_state->build_partitions, local_state._current_partition_id);
+        if (!build_partition.build_block) {
+            build_partition.build_block = std::move(local_state._recovered_build_block);
+        } else {
+            RETURN_IF_ERROR(build_partition.build_block->merge(
+                    local_state._recovered_build_block->to_block()));
+            local_state._recovered_build_block.reset();
+        }
+    }
+
+    // Split oversized build partitions before constructing the hash table.
+    bool has_data = false;
+    RETURN_IF_ERROR(_maybe_split_build_partition(state, local_state));
+    if (!local_state._has_current_partition) {
+        return Status::OK();
+    }
+
+    // Recover build data in batches; defer hash table build until recovery completes.
+    RETURN_IF_ERROR(local_state.recover_build_blocks_from_disk(
+            state, local_state._current_partition_id, has_data));
+    if (has_data) {
+        *need_wait = true;
+        return Status::OK();
+    }
+
+    RETURN_IF_ERROR(_setup_internal_operators(local_state, state));
+    local_state._need_to_setup_internal_operators = false;
+    // Always move buffered probe rows from unified source to blocks.
+    auto& partition = get_or_create_partition(local_state._shared_state->probe_partitions,
+                                              local_state._current_partition_id);
+    if (partition.accumulating_block && !partition.accumulating_block->empty()) {
+        partition.blocks.emplace_back(partition.accumulating_block->to_block());
+        // FIX: Reset the mutable block after converting to block to prevent duplicate rows
+        // if this partition is later split and reprocessed.
+        partition.accumulating_block.reset();
+    }
+
     return Status::OK();
 }
 
 Status PartitionedHashJoinProbeOperatorX::pull(doris::RuntimeState* state,
                                                vectorized::Block* output_block, bool* eos) const {
     auto& local_state = get_local_state(state);
+    const auto partition_index = base_partition_index(local_state._current_partition_id);
+    // Always read from probe_partitions for both base and split levels
+    auto& probe_blocks = get_or_create_partition(local_state._shared_state->probe_partitions,
+                                                 local_state._current_partition_id)
+                                 .blocks;
 
-    const auto partition_index = local_state._partition_cursor;
-    auto& probe_blocks = local_state._probe_blocks[partition_index];
-
-    if (local_state._recovered_build_block && !local_state._recovered_build_block->empty()) {
-        local_state._estimate_memory_usage += local_state._recovered_build_block->allocated_bytes();
-        auto& mutable_block = local_state._shared_state->partitioned_build_blocks[partition_index];
-        if (!mutable_block) {
-            mutable_block = std::move(local_state._recovered_build_block);
-        } else {
-            RETURN_IF_ERROR(mutable_block->merge(local_state._recovered_build_block->to_block()));
-            local_state._recovered_build_block.reset();
-        }
-    }
-
-    if (local_state._need_to_setup_internal_operators) {
-        bool has_data = false;
-        RETURN_IF_ERROR(local_state.recover_build_blocks_from_disk(
-                state, local_state._partition_cursor, has_data));
-        if (has_data) {
-            return Status::OK();
-        }
-
-        *eos = false;
-        RETURN_IF_ERROR(local_state.finish_spilling(partition_index));
-        RETURN_IF_ERROR(_setup_internal_operators(local_state, state));
-        local_state._need_to_setup_internal_operators = false;
-        auto& mutable_block = local_state._partitioned_blocks[partition_index];
-        if (mutable_block && !mutable_block->empty()) {
-            probe_blocks.emplace_back(mutable_block->to_block());
-        }
-    }
     bool in_mem_eos = false;
     auto* runtime_state = local_state._shared_state->inner_runtime_state.get();
     while (_inner_probe_operator->need_more_input_data(runtime_state)) {
         if (probe_blocks.empty()) {
             *eos = false;
             bool has_data = false;
-            RETURN_IF_ERROR(
-                    local_state.recover_probe_blocks_from_disk(state, partition_index, has_data));
+            RETURN_IF_ERROR(local_state.recover_probe_blocks_from_disk(
+                    state, local_state._current_partition_id, has_data));
             if (!has_data) {
                 vectorized::Block block;
                 RETURN_IF_ERROR(_inner_probe_operator->push(runtime_state, &block, true));
@@ -708,9 +1201,8 @@ Status PartitionedHashJoinProbeOperatorX::pull(doris::RuntimeState* state,
                         " partition:{}, has no data to recovery",
                         print_id(state->query_id()), node_id(), state->task_id(), partition_index);
                 break;
-            } else {
-                return Status::OK();
             }
+            return Status::OK();
         }
 
         auto block = std::move(probe_blocks.back());
@@ -728,11 +1220,17 @@ Status PartitionedHashJoinProbeOperatorX::pull(doris::RuntimeState* state,
         VLOG_DEBUG << fmt::format(
                 "Query:{}, hash join probe:{}, task:{},"
                 " partition:{}, probe done",
-                print_id(state->query_id()), node_id(), state->task_id(),
-                local_state._partition_cursor);
-        local_state._partition_cursor++;
+                print_id(state->query_id()), node_id(), state->task_id(), partition_index);
+        if (local_state._current_partition_id.level == 0 &&
+            !local_state._base_partition_split[partition_index]) {
+            local_state._partition_cursor++;
+        } else if (local_state._pending_partitions.empty()) {
+            local_state._partition_cursor++;
+        }
+        local_state._has_current_partition = false;
         local_state.update_profile_from_inner();
-        if (local_state._partition_cursor == _partition_count) {
+        if (local_state._partition_cursor >= _partition_count &&
+            local_state._pending_partitions.empty()) {
             *eos = true;
         } else {
             local_state._need_to_setup_internal_operators = true;
@@ -773,15 +1271,14 @@ size_t PartitionedHashJoinProbeOperatorX::_revocable_mem_size(RuntimeState* stat
                                             : vectorized::SpillStream::MAX_SPILL_WRITE_BATCH_MEM;
     auto& local_state = get_local_state(state);
     size_t mem_size = 0;
-    auto& probe_blocks = local_state._probe_blocks;
-    for (uint32_t i = 0; i < _partition_count; ++i) {
-        for (auto& block : probe_blocks[i]) {
+    // Calculate from unified probe_partitions storage
+    auto& partitions = local_state._shared_state->probe_partitions;
+    for (auto& [_, partition] : partitions) {
+        for (auto& block : partition.blocks) {
             mem_size += block.allocated_bytes();
         }
-
-        auto& partitioned_block = local_state._partitioned_blocks[i];
-        if (partitioned_block) {
-            auto block_bytes = partitioned_block->allocated_bytes();
+        if (partition.accumulating_block) {
+            auto block_bytes = partition.accumulating_block->allocated_bytes();
             if (block_bytes >= spill_size_threshold) {
                 mem_size += block_bytes;
             }
@@ -864,6 +1361,21 @@ Status PartitionedHashJoinProbeOperatorX::get_block(RuntimeState* state, vectori
                     int64_t(local_state.estimate_memory_usage()));
     });
 
+    if (is_spilled) {
+        // Prepare hash table first so probe rows are partitioned by the final build layout.
+        bool no_more_partitions = false;
+        RETURN_IF_ERROR(_select_partition_if_needed(local_state, &no_more_partitions));
+        if (no_more_partitions) {
+            *eos = true;
+            return Status::OK();
+        }
+        bool need_wait = false;
+        RETURN_IF_ERROR(_prepare_hash_table(state, local_state, &need_wait));
+        if (need_wait || !local_state._has_current_partition) {
+            return Status::OK();
+        }
+    }
+
     if (need_more_input_data(state)) {
         {
             SCOPED_TIMER(local_state._get_child_next_timer);
@@ -879,7 +1391,7 @@ Status PartitionedHashJoinProbeOperatorX::get_block(RuntimeState* state, vectori
         Defer clear_defer([&] { local_state._child_block->clear_column_data(); });
         if (is_spilled) {
             RETURN_IF_ERROR(push(state, local_state._child_block.get(), local_state._child_eos));
-            if (_should_revoke_memory(state)) {
+            if (_should_revoke_memory(state) || *eos) {
                 return _revoke_memory(state);
             }
         } else {
@@ -893,6 +1405,9 @@ Status PartitionedHashJoinProbeOperatorX::get_block(RuntimeState* state, vectori
     if (!need_more_input_data(state)) {
         SCOPED_TIMER(local_state.exec_time_counter());
         if (is_spilled) {
+            if (local_state._child_eos) {
+                RETURN_IF_ERROR(local_state.finish_spilling(local_state._current_partition_id));
+            }
             RETURN_IF_ERROR(pull(state, block, eos));
         } else {
             RETURN_IF_ERROR(_inner_probe_operator->pull(

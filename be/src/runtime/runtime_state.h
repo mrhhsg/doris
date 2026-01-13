@@ -661,9 +661,10 @@ public:
 
     int spill_hash_join_partition_count() const {
         if (_query_options.__isset.spill_hash_join_partition_count) {
-            return std::min(std::max(_query_options.spill_hash_join_partition_count, 16), 8192);
+            return std::min(std::max(_query_options.spill_hash_join_partition_count, 8), 8192);
         }
-        return 32;
+        // Default to fanout 8 to support multi-level spill partitioning.
+        return 8;
     }
 
     int64_t low_memory_mode_buffer_limit() const {

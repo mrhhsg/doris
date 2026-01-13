@@ -129,6 +129,14 @@ struct SpillPartitionChannelIds {
     }
 };
 
+struct SpillHashChannelIds {
+    // Hash-only channel id for spill split; the caller decides the fanout/level.
+    template <typename HashValueType>
+    HashValueType operator()(HashValueType l, size_t /*r*/) {
+        return (l >> 16) | (l << 16);
+    }
+};
+
 static inline uint32_t crc32c_shuffle_mix(uint32_t h) {
     // Step 1: fold high entropy into low bits
     h ^= h >> 16;

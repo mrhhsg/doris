@@ -26,10 +26,12 @@
 #include <sqltypes.h>
 
 #include <atomic>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 #include "common/config.h"
@@ -624,6 +626,47 @@ struct HashJoinSharedState : public JoinSharedState {
     std::vector<std::shared_ptr<JoinDataVariants>> hash_table_variant_vector;
 };
 
+// Hierarchical spill partitioning for hash join probe-side.
+static constexpr uint32_t kHashJoinSpillFanout = 8;
+static constexpr uint32_t kHashJoinSpillBitsPerLevel = 3;
+static constexpr uint32_t kHashJoinSpillMaxDepth = 6;
+
+struct HashJoinSpillPartitionId {
+    uint32_t level = 0;
+    uint32_t path = 0;
+
+    uint32_t key() const { return (level << 24) | path; }
+
+    HashJoinSpillPartitionId child(uint32_t child_index) const {
+        return {.level = level + 1,
+                .path = path | (child_index << ((level + 1) * kHashJoinSpillBitsPerLevel))};
+    }
+};
+
+struct HashJoinSpillPartition {
+    HashJoinSpillPartitionId id;
+    bool is_split = false;
+    std::vector<HashJoinSpillPartitionId> children;
+    // Probe-side buffered rows for this partition before flushing into blocks/spill.
+    std::unique_ptr<vectorized::MutableBlock> accumulating_block;
+    // Probe-side materialized blocks for this partition (in-memory).
+    std::vector<vectorized::Block> blocks;
+    vectorized::SpillStreamSPtr spill_stream;
+};
+
+using HashJoinSpillPartitionMap = std::unordered_map<uint32_t, HashJoinSpillPartition>;
+
+struct HashJoinSpillBuildPartition {
+    HashJoinSpillPartitionId id;
+    bool is_split = false;
+    std::vector<HashJoinSpillPartitionId> children;
+    // Build-side buffered rows for this partition before hash table build.
+    std::unique_ptr<vectorized::MutableBlock> build_block;
+    vectorized::SpillStreamSPtr spill_stream;
+};
+
+using HashJoinSpillBuildPartitionMap = std::unordered_map<uint32_t, HashJoinSpillBuildPartition>;
+
 struct PartitionedHashJoinSharedState
         : public HashJoinSharedState,
           public BasicSpillSharedState,
@@ -631,17 +674,18 @@ struct PartitionedHashJoinSharedState
     ENABLE_FACTORY_CREATOR(PartitionedHashJoinSharedState)
 
     void update_spill_stream_profiles(RuntimeProfile* source_profile) override {
-        for (auto& stream : spilled_streams) {
-            if (stream) {
-                stream->update_shared_profiles(source_profile);
+        for (auto& [_, partition] : build_partitions) {
+            if (partition.spill_stream) {
+                partition.spill_stream->update_shared_profiles(source_profile);
             }
         }
     }
 
     std::unique_ptr<RuntimeState> inner_runtime_state;
     std::shared_ptr<HashJoinSharedState> inner_shared_state;
-    std::vector<std::unique_ptr<vectorized::MutableBlock>> partitioned_build_blocks;
-    std::vector<vectorized::SpillStreamSPtr> spilled_streams;
+    HashJoinSpillPartitionMap probe_partitions;
+    HashJoinSpillBuildPartitionMap build_partitions;
+    std::deque<HashJoinSpillPartitionId> pending_probe_partitions;
     bool is_spilled = false;
 };
 
