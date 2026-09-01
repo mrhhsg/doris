@@ -75,6 +75,13 @@ public class LogicalResultSinkToShortCircuitPointQuery implements RewriteRuleFac
     // set short circuit flag and return the original plan
     private Plan shortCircuit(Plan root, OlapTable olapTable,
                 Set<Expression> conjuncts, StatementContext statementContext) {
+        // A short-circuit plan of a server prepared statement is reused by later EXECUTEs without
+        // re-analysis. Dictionary reads depend on the dictionary's privilege and version, neither of
+        // which the reuse check tracks, so such point queries take the normal path every time. The
+        // mark is set at bind time, so a read already folded into a literal still counts.
+        if (statementContext.hasDictionaryRead()) {
+            return root;
+        }
         // All key columns in conjuncts
         Set<String> colNames = Sets.newHashSet();
         for (Expression expr : conjuncts) {
@@ -99,7 +106,6 @@ public class LogicalResultSinkToShortCircuitPointQuery implements RewriteRuleFac
                     ).when(this::filterMatchShortCircuitCondition)))
                         .thenApply(ctx -> {
                             return shortCircuit(ctx.root, ctx.root.child().child().child().getTable(),
-
                                         ctx.root.child().child().getConjuncts(), ctx.statementContext);
                         })),
                 RuleType.SHOR_CIRCUIT_POINT_QUERY.build(

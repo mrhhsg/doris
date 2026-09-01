@@ -72,6 +72,7 @@ import org.apache.doris.nereids.trees.expressions.Variable;
 import org.apache.doris.nereids.trees.expressions.WhenClause;
 import org.apache.doris.nereids.trees.expressions.WindowExpression;
 import org.apache.doris.nereids.trees.expressions.functions.BoundFunction;
+import org.apache.doris.nereids.trees.expressions.functions.DictionaryReadFunction;
 import org.apache.doris.nereids.trees.expressions.functions.FunctionBuilder;
 import org.apache.doris.nereids.trees.expressions.functions.RewriteWhenAnalyze;
 import org.apache.doris.nereids.trees.expressions.functions.Udf;
@@ -586,10 +587,36 @@ public class ExpressionAnalyzer extends SubExprAnalyzer<ExpressionRewriteContext
             StatementContext statementContext = context.cascadesContext.getStatementContext();
             statementContext.setHasNondeterministic(true);
         }
+        if (buildResult.second instanceof DictionaryReadFunction) {
+            // Alias function bodies are analyzed without a CascadesContext (AliasUdfBuilder), but on
+            // the thread of the statement that expands them, so fall back to the current statement.
+            StatementContext statementContext = context != null && context.cascadesContext != null
+                    ? context.cascadesContext.getStatementContext()
+                    : ConnectContext.get() == null ? null : ConnectContext.get().getStatementContext();
+            if (statementContext != null) {
+                // Recorded on the statement (not the plan) so that no later rewrite, e.g. constant
+                // folding, can hide the dependency from the short-circuit point-query reuse check.
+                statementContext.setHasDictionaryRead(true);
+                // A persisted view is authorized as a whole by CheckPrivileges.visitLogicalView and
+                // its body is analyzed as the querying user, so a dictionary read inside it is
+                // trusted like the view's tables. Direct calls, alias function bodies and
+                // CREATE/ALTER VIEW bodies are checked here, once at bind time and before the
+                // dictionary is resolved, so a caller without the privilege can neither read the
+                // values nor probe whether the dictionary exists.
+                if (!statementContext.isAnalyzingView()) {
+                    ConnectContext connectContext = statementContext.getConnectContext() != null
+                            ? statementContext.getConnectContext() : ConnectContext.get();
+                    ((DictionaryReadFunction) buildResult.second).checkReadPrivilege(connectContext);
+                }
+            }
+        }
         if (wantToParseSqlFromSqlCache) {
             sqlCacheContext = context.cascadesContext.getStatementContext().getSqlCacheContext();
+            // Dictionary reads depend on the dictionary's privilege and version, which the sql cache
+            // neither records nor revalidates on a hit, so keep such statements out of it.
             if (builder instanceof AliasUdfBuilder
-                    || buildResult.second instanceof Udf) {
+                    || buildResult.second instanceof Udf
+                    || buildResult.second instanceof DictionaryReadFunction) {
                 if (sqlCacheContext.isPresent()) {
                     sqlCacheContext.get().setCannotProcessExpression(true);
                 }

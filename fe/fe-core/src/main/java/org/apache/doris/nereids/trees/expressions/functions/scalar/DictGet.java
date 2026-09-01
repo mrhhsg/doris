@@ -21,17 +21,21 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.FunctionSignature;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.Pair;
+import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.dictionary.Dictionary;
 import org.apache.doris.dictionary.DictionaryManager;
 import org.apache.doris.dictionary.LayoutType;
+import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.functions.AlwaysNullable;
 import org.apache.doris.nereids.trees.expressions.functions.CustomSignature;
+import org.apache.doris.nereids.trees.expressions.functions.DictionaryReadFunction;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.util.TypeCoercionUtils;
+import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.base.Preconditions;
 
@@ -41,7 +45,7 @@ import java.util.Optional;
 /**
  * dict_get function.
  */
-public class DictGet extends ScalarFunction implements CustomSignature, AlwaysNullable {
+public class DictGet extends ScalarFunction implements CustomSignature, AlwaysNullable, DictionaryReadFunction {
     /**
      * constructor with 3 arguments. (1. dbName.dictName, 2. queryKeyColumnName, 3. queryKeyValue)
      */
@@ -81,6 +85,21 @@ public class DictGet extends ScalarFunction implements CustomSignature, AlwaysNu
     @Override
     public FunctionSignature customSignature() {
         return customSignatureDict().key();
+    }
+
+    @Override
+    public void checkReadPrivilege(ConnectContext ctx) {
+        // Internal paths carry no user to check; a malformed first argument is rejected later by
+        // checkLegalityBeforeTypeCoercion with a proper message.
+        if (ctx == null || !(getArgument(0) instanceof Literal)) {
+            return;
+        }
+        String[] firstNames = ((Literal) getArgument(0)).getStringValue().split("\\."); // db.dict
+        if (firstNames.length == 2 && !Env.getCurrentEnv().getAccessManager().checkTblPriv(ctx,
+                InternalCatalog.INTERNAL_CATALOG_NAME, firstNames[0], firstNames[1], PrivPredicate.SELECT)) {
+            throw new AnalysisException("SELECT command denied to user " + ctx.getQualifiedUser()
+                    + " for dictionary '" + firstNames[0] + "." + firstNames[1] + "'");
+        }
     }
 
     /**

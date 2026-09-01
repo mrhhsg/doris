@@ -148,6 +148,10 @@ public class StatementContext implements Closeable {
     private boolean isDelete = false;
 
     private boolean hasNondeterministic = false;
+    // depth of persisted-view bodies currently being analyzed, see BindRelation.parseAndAnalyzeView
+    private int viewAnalysisDepth = 0;
+    // whether the statement (view bodies included) reads a dictionary through dict_get()/dict_get_many()
+    private boolean hasDictionaryRead = false;
 
     // hasUnknownColStats true if any column stats in the tables used by this sql is
     // unknown
@@ -510,6 +514,26 @@ public class StatementContext implements Closeable {
 
     public boolean hasNondeterministic() {
         return hasNondeterministic;
+    }
+
+    public void enterViewAnalysis() {
+        viewAnalysisDepth++;
+    }
+
+    public void exitViewAnalysis() {
+        viewAnalysisDepth--;
+    }
+
+    public boolean isAnalyzingView() {
+        return viewAnalysisDepth > 0;
+    }
+
+    public void setHasDictionaryRead(boolean hasDictionaryRead) {
+        this.hasDictionaryRead = hasDictionaryRead;
+    }
+
+    public boolean hasDictionaryRead() {
+        return hasDictionaryRead;
     }
 
     public ConnectContext getConnectContext() {

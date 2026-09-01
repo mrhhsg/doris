@@ -984,9 +984,17 @@ public class BindRelation extends OneAnalysisRuleFactory {
         }
         CascadesContext viewContext = CascadesContext.initContext(
                 parentContext.getStatementContext(), parsedViewPlan, PhysicalProperties.ANY);
-        viewContext.keepOrShowPlanProcess(parentContext.showPlanProcess(), () -> {
-            viewContext.newAnalyzer().analyze();
-        });
+        // The body is analyzed as the querying user but authorized as a whole by CheckPrivileges on
+        // the LogicalView, so bind-time checks that would otherwise apply to the user (dictionary
+        // reads) must know they are inside a persisted view.
+        parentContext.getStatementContext().enterViewAnalysis();
+        try {
+            viewContext.keepOrShowPlanProcess(parentContext.showPlanProcess(), () -> {
+                viewContext.newAnalyzer().analyze();
+            });
+        } finally {
+            parentContext.getStatementContext().exitViewAnalysis();
+        }
         parentContext.addPlanProcesses(viewContext.getPlanProcesses());
         // we should remove all group expression of the plan which in other memo, so the groupId would not conflict
         return viewContext.getRewritePlan();
